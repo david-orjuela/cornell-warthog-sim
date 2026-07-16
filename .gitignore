@@ -1,0 +1,59 @@
+# ROS / colcon
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+navrl_env/
+orchard_env/
+anaconda3/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# ROS bags
+rosbag2_*/
+*.db3
+*.mcap
+metadata.yaml
+
+# Models and ML checkpoints
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Large point clouds and maps
+*.pcd
+*.ply
+*.las
+*.laz
+
+# Generated evaluation output
+experiments/results/*
+!experiments/results/.gitkeep
+
+# Gazebo caches
+.gz/
+.ignition/
+
+# Credentials and machine-specific configuration
+.env
+*.token
+credentials*
+secrets*
+config/robot/robot.yaml
+
+# Temporary files
+tmp/
+cache/
+*.log
