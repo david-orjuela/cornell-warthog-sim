@@ -1,0 +1,28 @@
+<launch>
+    <!-- Node for playing back the bag file -->
+    <param name="/use_sim_time" value="true"/>
+    <arg name="bag_file" default="/datasets/Reconstruction/tree15_2024-02-17-15-10-56.bag"/>
+    <param name="bag_file_path" value="$(arg bag_file)"/>
+    <node name="bag_player" pkg="rosbag" type="play"
+    args="--clock $(arg bag_file) --delay 5 --rate 1.0"/>
+    <arg name="robot_description_file" default="$(find ur_description)/launch/load_ur5e.launch" doc="Robot description launch file."/>
+    <arg name="kinematics_config" default="$(find ur_description)/config/ur5e/default_kinematics.yaml"/>
+    <include file="$(arg robot_description_file)">
+        <arg name="kinematics_params" value="$(arg kinematics_config)"/>
+    </include>
+    <!-- <param name="model_path" value="$(find reconstruct)/model/model_best.pth" /> -->
+    <param name="model_path" value="$(find reconstruct)/model/tree_yolo11m.pt" />
+    <rosparam file="$(find reconstruct)/config/params.yaml" command="load" />
+    <rosparam file="$(find reconstruct)/config/skeletonization_params.yaml" command="load" />
+
+    <!-- Your custom node for processing joint states -->
+<!--     <node name="reconstruct" pkg="reconstruct" type="reconstruct.py" output="screen"/> -->
+<!--     <node name="map_camera_publisher" pkg="tf" type="static_transform_publisher" args="0.0 0.0485 0.1325 0.5 0.5 0.5 -0.5 tool0 camera_base 10"/> -->
+    <node name="map_camera_publisher" pkg="tf" type="static_transform_publisher" args="0.0 0.0485 0.1325 0 0 0 1 tool0 azure 100"/>
+
+    <node name="pointcloud" pkg="reconstruct" type="pointcloud_processing.py" output="screen" required="true"/>
+
+    <!-- <node name="skeletonize" pkg="reconstruct" type="skeletonization.py" output="screen"/> -->
+
+    <!-- <node type="rviz" name="rviz" pkg="rviz" args="-d $(find reconstruct)/rviz/tfs.rviz" required="false"/> -->
+</launch>

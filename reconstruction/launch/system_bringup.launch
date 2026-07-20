@@ -1,0 +1,11 @@
+<launch>
+    <arg name="sim" default="false"/>
+    <arg name="ip" default="169.254.174.43"/>
+    <include file="$(find ur_robot_driver)/launch/ur5e_bringup.launch">
+        <arg if="$(arg sim)" name="robot_ip" value="192.168.56.101"/>
+        <arg unless="$(arg sim)" name="robot_ip" value="$(arg ip)"/>
+        <arg unless="$(arg sim)" name="kinematics_config"  value="$(find ur_calibration)/etc/my_robot_calibration.yaml"/>
+    </include>
+    <include file="$(find azure_kinect_ros_driver)/launch/kinect_rgbd.launch"/>
+    <node name="map_camera_publisher" pkg="tf" type="static_transform_publisher" args="0.0 0.0485 0.1325 0.5 0.5 0.5 -0.5 tool0 camera_base 10"/>
+</launch>

@@ -1,0 +1,50 @@
+<launch>
+    <!-- Define arguments for flexibility -->
+    <arg name="buffer_size" default="1024"/>
+    <arg name="bag_filename" default="/home/dawoodahmed/WSU/Datasets/Mar_29_Reconstruction_Data/tree30.bag"/>
+    <!-- Node to record the bag file with specified topics and arguments -->
+    <node name="rosbag_record" pkg="rosbag" type="record" args="record -o $(arg bag_filename) -b $(arg buffer_size) /depth_to_rgb/camera_info /depth_to_rgb/hw_registered/image_rect
+        /depth_to_rgb/hw_registered/image_rect_raw
+        /depth_to_rgb/image
+        /depth_to_rgb/image_raw
+        /depth_to_rgb_rectify_depth/parameter_descriptions
+        /depth_to_rgb_rectify_depth/parameter_updates
+        /joint_group_vel_controller/command
+        /joint_states
+        /pos_joint_traj_controller/command
+        /pos_joint_traj_controller/follow_joint_trajectory/cancel
+        /pos_joint_traj_controller/follow_joint_trajectory/feedback
+        /pos_joint_traj_controller/follow_joint_trajectory/goal
+        /pos_joint_traj_controller/follow_joint_trajectory/result
+        /pos_joint_traj_controller/follow_joint_trajectory/status
+        /pos_joint_traj_controller/state
+        /rgb/camera_info
+        /rgb/image_raw
+        /rgb/image_rect_color
+        /rgb_rectify_color/parameter_descriptions
+        /rgb_rectify_color/parameter_updates
+        /rosout
+        /rosout_agg
+        /scaled_pos_joint_traj_controller/command
+        /scaled_pos_joint_traj_controller/follow_joint_trajectory/cancel
+        /scaled_pos_joint_traj_controller/follow_joint_trajectory/feedback
+        /scaled_pos_joint_traj_controller/follow_joint_trajectory/goal
+        /scaled_pos_joint_traj_controller/follow_joint_trajectory/result
+        /scaled_pos_joint_traj_controller/follow_joint_trajectory/status
+        /scaled_pos_joint_traj_controller/state
+        /speed_scaling_factor
+        /tf
+        /tf_static
+        /ur_hardware_interface/io_states
+        /ur_hardware_interface/robot_mode
+        /ur_hardware_interface/robot_program_running
+        /ur_hardware_interface/safety_mode
+        /ur_hardware_interface/script_command
+        /ur_hardware_interface/set_mode/cancel
+        /ur_hardware_interface/set_mode/feedback
+        /ur_hardware_interface/set_mode/goal
+        /ur_hardware_interface/set_mode/result
+        /ur_hardware_interface/set_mode/status
+        /ur_hardware_interface/tool_data
+        /wrench"/>
+</launch>
