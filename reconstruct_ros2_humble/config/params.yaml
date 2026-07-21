@@ -1,0 +1,139 @@
+tree_point_cloud_reconstructor:
+  ros__parameters:
+    use_sim_time: true
+
+    # UR5e end-effector Jetson / RealSense streams from the provided topic list.
+    color_topic: /sensors/camera_jetson/color/image_raw
+    depth_topic: /sensors/camera_jetson/aligned_depth_to_color/image_raw
+    camera_info_topic: /sensors/camera_jetson/aligned_depth_to_color/camera_info
+
+    capture_topic: /capture_alert
+    capture_done_topic: /capture_done
+    scan_finished_topic: /scan_finished
+    output_cloud_topic: /tree_scan/global_cloud
+    original_cloud_topic: /tree_scan/latest_tf_cloud
+
+    # Change this only after inspecting `ros2 run tf2_tools view_frames`.
+    target_frame: base_link
+    # Leave empty to use the aligned depth message's optical frame.
+    camera_frame_override: ""
+
+    output_root: ~/tree_scans
+    scan_id: indoor_model_tree
+    capture_on_start: false
+
+    sync_queue_size: 30
+    sync_slop_sec: 0.08
+    tf_timeout_sec: 0.75
+
+    min_depth_m: 0.15
+    max_depth_m: 2.50
+    # 0 = auto: 1000 for 16UC1, 1 for 32FC1.
+    depth_scale_override: 0.0
+
+    local_voxel_size_m: 0.006
+    global_voxel_size_m: 0.005
+    outlier_removal_enabled: true
+    outlier_radius_m: 0.020
+    outlier_min_neighbors: 6
+
+    use_icp: true
+    icp_crop_margin_m: 0.15
+    icp_min_target_points: 200
+    max_icp_correction_translation_m: 0.10
+    max_icp_correction_rotation_deg: 12.0
+
+    save_frames: true
+    publish_original_cloud: true
+    shutdown_on_scan_finished: false
+
+    registration:
+      SN3:
+        voxel_size_m: 0.05
+        max_correspondence_distance_m: 0.05
+        max_iterations: 50
+        relative_rmse: 1.0e-6
+        relative_fitness: 1.0e-6
+        rmse_threshold_m: 0.025
+        fitness_threshold: 0.35
+      SN2:
+        voxel_size_m: 0.02
+        max_correspondence_distance_m: 0.03
+        max_iterations: 30
+        relative_rmse: 1.0e-6
+        relative_fitness: 1.0e-6
+        rmse_threshold_m: 0.015
+        fitness_threshold: 0.40
+      SN1:
+        voxel_size_m: 0.01
+        max_correspondence_distance_m: 0.018
+        max_iterations: 20
+        relative_rmse: 1.0e-6
+        relative_fitness: 1.0e-6
+        rmse_threshold_m: 0.010
+        fitness_threshold: 0.45
+      SN0:
+        voxel_size_m: 0.0
+        max_correspondence_distance_m: 0.012
+        max_iterations: 15
+        relative_rmse: 1.0e-6
+        relative_fitness: 1.0e-6
+        rmse_threshold_m: 0.008
+        fitness_threshold: 0.50
+
+trajectory_planner:
+  ros__parameters:
+    use_sim_time: true
+
+    # Safety interlock. The launch file also exposes this as an argument.
+    execute_motion: false
+
+    # This is the only candidate JointState topic in the supplied topic list.
+    # It MUST contain all six UR5e joints; otherwise remap this parameter.
+    joint_state_topic: /platform/joint_states
+
+    # Gazebo Fortress + gz_ros2_control normally uses the unscaled controller.
+    # A real UR driver commonly uses:
+    # /scaled_joint_trajectory_controller/follow_joint_trajectory
+    trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
+
+    joint_names:
+      - shoulder_pan_joint
+      - shoulder_lift_joint
+      - elbow_joint
+      - wrist_1_joint
+      - wrist_2_joint
+      - wrist_3_joint
+
+    capture_topic: /capture_alert
+    capture_done_topic: /capture_done
+    scan_finished_topic: /scan_finished
+
+    robot_file: ur5e.yml
+    # cuRobo's built-in collision_table.yml is a 5 m x 5 m floor slab at z=0.
+    # Replace this with a measured world file before real-robot use.
+    world_file: collision_table.yml
+    cuda_device: 0
+    interpolation_dt_sec: 0.02
+    trajectory_time_scale: 1.75
+
+    action_server_timeout_sec: 15.0
+    trajectory_timeout_sec: 90.0
+    joint_state_timeout_sec: 15.0
+    capture_subscriber_timeout_sec: 15.0
+    capture_timeout_sec: 10.0
+    settle_time_sec: 1.0
+
+    # Conservative first indoor raster. Increase only after collision checking.
+    scan_width_m: 0.24
+    scan_height_m: 0.32
+    scan_columns: 3
+    scan_rows: 4
+
+    # Scan-plane axes expressed in the UR5e end-effector frame at scan start.
+    scan_axis_u_ee: [1.0, 0.0, 0.0]
+    scan_axis_v_ee: [0.0, 1.0, 0.0]
+
+    capture_at_start: true
+    return_to_start: true
+    skip_origin_grid_point: true

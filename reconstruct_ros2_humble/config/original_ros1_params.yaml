@@ -1,0 +1,35 @@
+Registration:
+  Simple metric decimal places: 6
+  Scales:
+    SN0:
+      Maximum correspondence distance: 0.01
+      Inlier RMSE change threshold: 1.0e-07
+      Fitness change threshold: 1.0e-07
+      Maximum iterations: 5
+      Inlier RMSE threshold: 0.006
+      Fitness threshold: 0.55
+    SN1:
+      Voxel size: 0.01
+      Inlier RMSE change threshold: 1.0e-07
+      Fitness change threshold: 1.0e-07
+      Maximum iterations: 10
+      Inlier RMSE threshold: 0.006
+      Fitness threshold: 0.55
+    SN2:
+      Voxel size: 0.02
+      Inlier RMSE change threshold: 1.0e-07
+      Fitness change threshold: 1.0e-07
+      Maximum iterations: 20
+      Inlier RMSE threshold: 0.012
+      Fitness threshold: 0.55
+    SN3:
+      Voxel size: 0.05
+      Inlier RMSE change threshold: 1.0e-07
+      Fitness change threshold: 1.0e-07
+      Maximum iterations: 50
+      Inlier RMSE threshold: 0.025
+      Fitness threshold: 0.55
+Down sampling:
+  Global point cloud down sample voxel size: 0.003
+  Local point cloud down sample voxel size: 0.003
+  Model point cloud down sample voxel size: 0.003

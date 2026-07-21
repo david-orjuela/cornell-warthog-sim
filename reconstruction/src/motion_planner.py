@@ -58,14 +58,16 @@ class TrajectoryController:
         self.target_controller = self.joint_trajectory_controllers[0] # scaled_pos_joint_traj_controller
         self.switch_controller(self.target_controller)
 
-        try:
-            self.trajectory_client.wait_for_server()
-        except rospy.exceptions.ROSException as err:
-            rospy.logerr("Could not reach controller switch service. Msg: {}".format(err))
-            sys.exit(-1)
-
         self.trajectory_client = actionlib.SimpleActionClient(
-            "{}/follow_joint_trajectory".format(self.target_controller), FollowJointTrajectoryAction, )
+            f"{self.target_controller}/follow_joint_trajectory",
+            FollowJointTrajectoryAction,
+        )
+
+        if not self.trajectory_client.wait_for_server(rospy.Duration(5.0)):
+            rospy.logerr(
+                f"Could not reach trajectory action server for {self.target_controller}"
+            )
+            sys.exit(-1)
 
         # curobo
         tensor_args = TensorDeviceType()
@@ -96,28 +98,55 @@ class TrajectoryController:
         # Not used in scanning_mode()
 
     # Stores the latest joint positions
-    def joint_state_callback(self, data): 
-        self.joint_positions = list(data.position)
-        self.joint_names_received = list(data.name)
-
-        # Reorder positions using name, not just positions (safer)
+    def joint_state_callback(self, data):
         positions_by_name = dict(zip(data.name, data.position))
-        joint_positions = [
+
+        missing = [
+            name for name in self.joint_names
+            if name not in positions_by_name
+        ]
+        if missing:
+            rospy.logwarn_throttle(
+                2.0,
+                f"Joint-state message missing joints: {missing}"
+            )
+            return
+
+        self.joint_positions = [
             positions_by_name[name]
             for name in self.joint_names
         ]
+        self.joint_names_received = list(data.name)
         self.received_joint_states = True
 
     def send_goal(self, joint_trajectory_goal):
         """send trajectory using selected action server"""
         rospy.loginfo("Executing trajectory using the {}".format(self.target_controller))
         self.trajectory_client.send_goal(joint_trajectory_goal)
-        self.trajectory_client.wait_for_result()
+        if not self.trajectory_client.wait_for_result(rospy.Duration(60.0)):
+            rospy.logerr("Trajectory execution timed out")
+            self.trajectory_client.cancel_goal()
+            self.manipulation_error = -1
+            return False
 
         result = self.trajectory_client.get_result()
+        if result is None:
+            rospy.logerr("Trajectory action returned no result")
+            self.manipulation_error = -1
+            return False
+        
         rospy.loginfo("Trajectory execution finished in state {}".format(result.error_code))
         self.manipulation_error = result.error_code
         # Because it blocks, each scan movement finishes before the next one begins.
+
+    def normalize_quaternion(self, q):
+        q = np.asarray(q, dtype=np.float32)
+        norm = np.linalg.norm(q)
+
+        if norm < 1e-8:
+            raise ValueError("Quaternion norm is zero")
+
+        return q / norm
 
     # Motion planning function
     def curobo_motion_execute(self, relative_translation, relative_rotation, pure_rotation=False):
@@ -151,8 +180,12 @@ class TrajectoryController:
 
         # Step 3: Build a relative transform
         relative_translation = torch.tensor(np.array(relative_translation, np.float32), device='cuda:0')
-        relative_rotation = torch.tensor(np.array(relative_rotation, np.float32), device='cuda:0')
-
+        relative_rotation = self.normalize_quaternion(relative_rotation)
+        relative_rotation = torch.tensor(
+            relative_rotation,
+            dtype=torch.float32,
+            device='cuda:0'
+        )
         start_pose_copy = start_pose.clone()
         relative_pose = Pose(relative_translation, relative_rotation)
         final_pose = start_pose.multiply(relative_pose) # TODO: Verify cuRobo's convention if designing a new path (not likely)
@@ -172,7 +205,11 @@ class TrajectoryController:
         # Find a joint trajectory from the current state to the desired end-effector pose.
 
         print('-----------------')
-        if result.success:
+        success = result.success
+        if hasattr(success, "item"):
+            success = success.item()
+
+        if success:
             rospy.loginfo("Trajectory path planning success")
             plan = result.optimized_plan
             dt = result.optimized_dt.item()
@@ -184,9 +221,9 @@ class TrajectoryController:
             # Step 6: Convert cuRobo plan to ROS trajectory
             for position, velocity, acceleration in zip(plan.position, plan.velocity, plan.acceleration):
                 point = JointTrajectoryPoint()
-                point.positions = position
-                point.velocities = velocity
-                point.accelerations = acceleration
+                point.positions = position.detach().cpu().tolist()
+                point.velocities = velocity.detach().cpu().tolist()
+                point.accelerations = acceleration.detach().cpu().tolist()
                 time_counter += rospy.Duration(dt)
                 point.time_from_start = time_counter
                 goal.trajectory.points.append(point)
@@ -332,12 +369,20 @@ class TrajectoryController:
 
 
 if __name__ == "__main__":
-    trajectory_controller = TrajectoryController()
-    trajectory_controller.go_home()
+    if not rospy.get_param("~execute_motion", False):
+        rospy.logwarn(
+            "Motion execution disabled. Set ~execute_motion:=true after verifying the workspace."
+        )
+        sys.exit(0)
 
-    # TODO: add sleep so it does not busy-wait until first joint-state message arrives
-    while True:
+    trajectory_controller = TrajectoryController()
+    while not rospy.is_shutdown() and not trajectory_controller.received_joint_states:
+        rospy.sleep(0.1)
         if trajectory_controller.received_joint_states:
             trajectory_controller.scanning_mode()
             trajectory_controller.go_home()
             break
+
+    if rospy.is_shutdown():
+        sys.exit(0)
+        
