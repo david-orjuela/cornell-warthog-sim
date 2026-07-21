@@ -59,7 +59,7 @@ class TrajectoryController:
         self.switch_controller(self.target_controller)
 
         try:
-            self.trajectory_client.wait_for_server(timeout.to_sec())
+            self.trajectory_client.wait_for_server()
         except rospy.exceptions.ROSException as err:
             rospy.logerr("Could not reach controller switch service. Msg: {}".format(err))
             sys.exit(-1)
@@ -70,13 +70,14 @@ class TrajectoryController:
         # curobo
         tensor_args = TensorDeviceType()
         robot_file = "ur5e.yml"
-        world_file = "collision_table.yml"
+        world_file = "collision_table.yml" # Plans paths considering obstacles encoded in YAML
         self.manipulation_error = 0
 
         motion_gen_config = MotionGenConfig.load_from_robot_config(robot_file, world_file, tensor_args,
                                                                    interpolation_dt=0.01)
         self.motion_gen = MotionGen(motion_gen_config)
-        self.motion_gen.warmup(enable_graph=False)
+        self.motion_gen.warmup(enable_graph=False) # initializes GPU planning structures
+
         robot_cfg = load_yaml(join_path(get_robot_configs_path(), robot_file))["robot_cfg"]
         robot_cfg = RobotConfig.from_dict(robot_cfg, tensor_args)
 
@@ -85,13 +86,17 @@ class TrajectoryController:
                                      "wrist_2_joint", "wrist_3_joint"]
 
         # ur5e joint states
-        rospy.Subscriber("/joint_states", JointState_msg, self.joint_state_callback)
+        rospy.Subscriber("/joint_states", JointState_msg, self.joint_state_callback) # planner needs the real, current robot state
         self.received_joint_states = False
 
         # capture alert publisher
         self.alert_publisher = rospy.Publisher('capture_alert', Bool, queue_size=10)
 
-    def joint_state_callback(self, data):
+        # The bool above is used to trigger the point cloud capture (after robot motion)
+        # Not used in scanning_mode()
+
+    # Stores the latest joint positions
+    def joint_state_callback(self, data): 
         self.joint_positions = list(data.position)
         self.joint_names_received = list(data.name)
         self.received_joint_states = True
@@ -106,11 +111,13 @@ class TrajectoryController:
         rospy.loginfo("Trajectory execution finished in state {}".format(result.error_code))
         self.manipulation_error = result.error_code
 
+    # Motion planning function
     def curobo_motion_execute(self, relative_translation, relative_rotation, pure_rotation=False):
         """curobo motion planner"""
         joint_positions = copy.copy(self.joint_positions)
         joint_names = self.joint_names
 
+        # Reorder positions using name, not just positions (safer)
         joint_positions[0], joint_positions[2] = joint_positions[2], joint_positions[0]
         start_state = JointState.from_position(
             torch.tensor(np.array(joint_positions, dtype=np.float32), device='cuda:0').view(1, -1))
