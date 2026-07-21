@@ -1,6 +1,6 @@
 tree_point_cloud_reconstructor:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
 
     # UR5e end-effector Jetson / RealSense streams from the provided topic list.
     color_topic: /sensors/camera_jetson/color/image_raw
@@ -16,7 +16,7 @@ tree_point_cloud_reconstructor:
     # Change this only after inspecting `ros2 run tf2_tools view_frames`.
     target_frame: base_link
     # Leave empty to use the aligned depth message's optical frame.
-    camera_frame_override: ""
+    camera_frame_override: "camera_jetson_color_optical_frame"
 
     output_root: ~/tree_scans
     scan_id: indoor_model_tree
@@ -83,19 +83,19 @@ tree_point_cloud_reconstructor:
 
 trajectory_planner:
   ros__parameters:
-    use_sim_time: true
+    use_sim_time: false
 
     # Safety interlock. The launch file also exposes this as an argument.
     execute_motion: false
 
     # This is the only candidate JointState topic in the supplied topic list.
     # It MUST contain all six UR5e joints; otherwise remap this parameter.
-    joint_state_topic: /platform/joint_states
+    joint_state_topic: /joint_states
 
     # Gazebo Fortress + gz_ros2_control normally uses the unscaled controller.
     # A real UR driver commonly uses:
     # /scaled_joint_trajectory_controller/follow_joint_trajectory
-    trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
+    trajectory_action: /scaled_joint_trajectory_controller/follow_joint_trajectory
 
     joint_names:
       - shoulder_pan_joint
