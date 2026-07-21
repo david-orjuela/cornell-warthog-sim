@@ -99,6 +99,13 @@ class TrajectoryController:
     def joint_state_callback(self, data): 
         self.joint_positions = list(data.position)
         self.joint_names_received = list(data.name)
+
+        # Reorder positions using name, not just positions (safer)
+        positions_by_name = dict(zip(data.name, data.position))
+        joint_positions = [
+            positions_by_name[name]
+            for name in self.joint_names
+        ]
         self.received_joint_states = True
 
     def send_goal(self, joint_trajectory_goal):
@@ -110,30 +117,60 @@ class TrajectoryController:
         result = self.trajectory_client.get_result()
         rospy.loginfo("Trajectory execution finished in state {}".format(result.error_code))
         self.manipulation_error = result.error_code
+        # Because it blocks, each scan movement finishes before the next one begins.
 
     # Motion planning function
     def curobo_motion_execute(self, relative_translation, relative_rotation, pure_rotation=False):
-        """curobo motion planner"""
-        joint_positions = copy.copy(self.joint_positions)
+        """
+        curobo motion planner
+        asks cuRobo to move the end effector relative to its current pose.
+        """
+        # Step 1: Build current robot state
+        joint_positions = self.joint_positions
         joint_names = self.joint_names
 
-        # Reorder positions using name, not just positions (safer)
-        joint_positions[0], joint_positions[2] = joint_positions[2], joint_positions[0]
+        # Implemented safely in joint_state_callback
+        # joint_positions[0], joint_positions[2] = (
+        #     joint_positions[2],
+        #     joint_positions[0],
+        # )
+        
+        # convert the joint positions into a CUDA tensor
         start_state = JointState.from_position(
-            torch.tensor(np.array(joint_positions, dtype=np.float32), device='cuda:0').view(1, -1))
+            torch.tensor(
+                np.array(joint_positions, dtype=np.float32), 
+                device='cuda:0' # Hardcoded; will not work on a CPU-only computer
+            ).view(1, -1)
+        )
 
-        start_state_kin = self.motion_gen.compute_kinematics(start_state)
-        translation = start_state_kin.ee_pos_seq.squeeze()
-        rotation = start_state_kin.ee_quat_seq.squeeze()
+        # Step 2: Compute current end-effector pose
+        start_state_kin = self.motion_gen.compute_kinematics(start_state) # current joint angles
+        translation = start_state_kin.ee_pos_seq.squeeze() # end-effector position
+        rotation = start_state_kin.ee_quat_seq.squeeze() # end-effector quaternion
         start_pose = Pose(translation, rotation)
+
+        # Step 3: Build a relative transform
         relative_translation = torch.tensor(np.array(relative_translation, np.float32), device='cuda:0')
         relative_rotation = torch.tensor(np.array(relative_rotation, np.float32), device='cuda:0')
+
         start_pose_copy = start_pose.clone()
         relative_pose = Pose(relative_translation, relative_rotation)
-        final_pose = start_pose.multiply(relative_pose)
+        final_pose = start_pose.multiply(relative_pose) # TODO: Verify cuRobo's convention if designing a new path (not likely)
+        # Conceptually: world_T_final = world_T_current × current_T_relative
+        # translation is probably expressed in the current tool/end-effector coordinate frame
+
+        # Discards any translation introduced by pose multiplication and retains only the new orientation.
         if pure_rotation:
             final_pose.position = start_pose_copy.position
-        result = self.motion_gen.plan_single(start_state, final_pose, MotionGenPlanConfig())
+
+        # Step 5: Plan
+        result = self.motion_gen.plan_single(
+            start_state, 
+            final_pose, 
+            MotionGenPlanConfig()
+        )
+        # Find a joint trajectory from the current state to the desired end-effector pose.
+
         print('-----------------')
         if result.success:
             rospy.loginfo("Trajectory path planning success")
@@ -143,6 +180,8 @@ class TrajectoryController:
             goal = FollowJointTrajectoryGoal()
             goal.trajectory.joint_names = joint_names
             time_counter = rospy.Duration(0)
+
+            # Step 6: Convert cuRobo plan to ROS trajectory
             for position, velocity, acceleration in zip(plan.position, plan.velocity, plan.acceleration):
                 point = JointTrajectoryPoint()
                 point.positions = position
@@ -152,32 +191,43 @@ class TrajectoryController:
                 point.time_from_start = time_counter
                 goal.trajectory.points.append(point)
             self.send_goal(goal)
+            # ROS goal includes: Positions, Velocities, Accelerations, Time for every waypoint
+            # TODO: Confirm whether cuRobo expects [w, x, y, z] or [x, y, z, w]
+
         else:
             rospy.loginfo("Trajectory path planning failed")
 
+    
     def switch_controller(self, target_controller):
         """Activates the desired controller and stops all others from the predefined list above"""
+        # Ensure only the selected controller is active
         other_controllers = (
-                self.joint_trajectory_controllers + self.cartesian_trajectory_controllers + self.conflicting_controllers)
-
+            self.joint_trajectory_controllers 
+            + self.cartesian_trajectory_controllers
+            + self.conflicting_controllers
+        )
         other_controllers.remove(target_controller)
 
-        srv = ListControllersRequest()
+        
+        srv = ListControllersRequest() # list current controllers
         response = self.list_srv(srv)
         for controller in response.controller:
             if controller.name == target_controller and controller.state == "running":
                 return
+        # return immediately if the requested on is already running
 
-        srv = LoadControllerRequest()
+        srv = LoadControllerRequest() # load requested controller
         srv.name = target_controller
         self.load_srv(srv)
 
         srv = SwitchControllerRequest()
-        srv.stop_controllers = other_controllers
-        srv.start_controllers = [target_controller]
-        srv.strictness = SwitchControllerRequest.BEST_EFFORT
+        srv.stop_controllers = other_controllers # stop the other controllers
+        srv.start_controllers = [target_controller] # start requested one
+        srv.strictness = SwitchControllerRequest.BEST_EFFORT # means a partial switch can be accepted
         self.switch_srv(srv)
 
+    # TODO: Sends robot to a hardcoded configuration over two seconds.
+    # Ensure it is safe for the current mounting arrangement
     def go_home(self):
         """moves robot to home position"""
         goal = FollowJointTrajectoryGoal()
@@ -189,13 +239,25 @@ class TrajectoryController:
         goal.trajectory.points.append(point)
         self.send_goal(goal)  # self.alert_publisher.publish(True)  # rospy.sleep(3)
 
+    # Wrapper that prevents future motion after an execution error
     def move_tool(self, translation, rotation, pure_rotation=False):
         if self.manipulation_error == 0:
             self.curobo_motion_execute(translation, rotation, pure_rotation)
         else:
             print("Manipulation failed!")
-
+    
+    # Most relevant portion (pruning not needed)
     def scanning_mode(self):
+        # TODO: Replace this long sequence of relative moments with a list of absolute end-effector poses
+        # or a generated raster pattern with named parameters
+        # e.g.: 
+        # scan_width = 0.6
+        # scan_height = 0.5
+        # columns = 5
+        # rows = 4
+        # standoff = 0.6
+
+        
         # self.alert_publisher.publish(True)
         # rospy.sleep(2)
         # self.move_tool([0, 0, 0], [1, 0.2, 0, 0])
@@ -273,6 +335,7 @@ if __name__ == "__main__":
     trajectory_controller = TrajectoryController()
     trajectory_controller.go_home()
 
+    # TODO: add sleep so it does not busy-wait until first joint-state message arrives
     while True:
         if trajectory_controller.received_joint_states:
             trajectory_controller.scanning_mode()
