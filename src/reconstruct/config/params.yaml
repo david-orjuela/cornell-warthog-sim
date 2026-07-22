@@ -48,7 +48,7 @@ tree_point_cloud_reconstructor:
     shutdown_on_scan_finished: false
 
     registration:
-      SN3:
+      SN3: # Coarse
         voxel_size_m: 0.05
         max_correspondence_distance_m: 0.05
         max_iterations: 50
@@ -72,7 +72,7 @@ tree_point_cloud_reconstructor:
         relative_fitness: 1.0e-6
         rmse_threshold_m: 0.010
         fitness_threshold: 0.45
-      SN0:
+      SN0: # Fine
         voxel_size_m: 0.0
         max_correspondence_distance_m: 0.012
         max_iterations: 15
