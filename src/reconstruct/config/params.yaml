@@ -14,9 +14,9 @@ tree_point_cloud_reconstructor:
     original_cloud_topic: /tree_scan/latest_tf_cloud
 
     # Change this only after inspecting `ros2 run tf2_tools view_frames`.
-    target_frame: base_link
+    target_frame: camera_jetson_color_optical_frame #base_link
     # Leave empty to use the aligned depth message's optical frame.
-    camera_frame_override: "camera_jetson_color_optical_frame"
+    camera_frame_override: camera_jetson_color_optical_frame
 
     output_root: ~/tree_scans
     scan_id: indoor_model_tree
@@ -26,8 +26,8 @@ tree_point_cloud_reconstructor:
     sync_slop_sec: 0.08
     tf_timeout_sec: 0.75
 
-    min_depth_m: 0.15
-    max_depth_m: 2.50
+    min_depth_m: 0.01
+    max_depth_m: 1.50
     # 0 = auto: 1000 for 16UC1, 1 for 32FC1.
     depth_scale_override: 0.0
 

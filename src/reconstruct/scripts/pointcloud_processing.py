@@ -270,6 +270,12 @@ class TreePointCloudReconstructor(Node):
             color_rgb, depth_array, depth_scale, intrinsic = self._process_images(
                 color_msg, depth_msg, camera_info
             )
+            self.get_logger().info(
+                f"Depth encoding={depth_msg.encoding}, "
+                f"dtype={depth_array.dtype}, "
+                f"shape={depth_array.shape}, "
+                f"depth_scale={depth_scale}"
+            )
             pcd_camera = self._rgbd_to_cloud(
                 color_rgb, depth_array, depth_scale, intrinsic
             )
@@ -321,11 +327,17 @@ class TreePointCloudReconstructor(Node):
             elapsed_ms = (time.perf_counter() - start_wall) * 1000.0
             self.reconstruction_times_ms.append(elapsed_ms)
             status = "accepted" if accepted else "rejected"
-            metric_text = (
-                "first frame / TF only"
-                if fitness is None
-                else f"fitness={fitness:.3f}, rmse={rmse * 1000.0:.1f} mm"
-            )
+            if accepted and fitness is None:
+                metric_text = "first frame / TF only"
+            elif not accepted and len(filtered_cloud.points) == 0:
+                metric_text = "empty cloud after filtering"
+            elif fitness is None:
+                metric_text = "rejected before ICP"
+            else:
+                metric_text = (
+                    f"fitness={fitness:.3f}, "
+                    f"rmse={rmse * 1000.0:.1f} mm"
+                )
             self.get_logger().info(
                 f"Capture {self.capture_sequence + 1} {status}: {metric_text}; "
                 f"global points={len(self.global_pc.points)}; {elapsed_ms:.1f} ms"
@@ -347,8 +359,15 @@ class TreePointCloudReconstructor(Node):
             self.processing = False
 
     def _lookup_transform_matrix(
-        self, target_frame: str, source_frame: str, stamp
+        self,
+        target_frame: str,
+        source_frame: str,
+        stamp,
     ) -> Optional[np.ndarray]:
+        # Camera-only mode: the cloud is already expressed in the desired frame.
+        if target_frame == source_frame:
+            return np.eye(4, dtype=np.float64)
+
         try:
             transform = self.tf_buffer.lookup_transform(
                 target_frame,
@@ -358,14 +377,22 @@ class TreePointCloudReconstructor(Node):
             )
         except TransformException as exc:
             self.get_logger().warning(
-                f"TF unavailable: {target_frame} <- {source_frame} at sensor time: {exc}"
+                f"TF unavailable: {target_frame} <- {source_frame} "
+                f"at sensor time: {exc}"
             )
             return None
 
         t = transform.transform.translation
         q = transform.transform.rotation
-        matrix = self._quaternion_xyzw_to_matrix(q.x, q.y, q.z, q.w)
+
+        matrix = self._quaternion_xyzw_to_matrix(
+            q.x,
+            q.y,
+            q.z,
+            q.w,
+        )
         matrix[:3, 3] = [t.x, t.y, t.z]
+
         return matrix
 
     @staticmethod
@@ -388,26 +415,78 @@ class TreePointCloudReconstructor(Node):
         )
 
     def _process_images(
-        self, color_msg: Image, depth_msg: Image, camera_info: CameraInfo
-    ) -> Tuple[np.ndarray, np.ndarray, float, o3d.camera.PinholeCameraIntrinsic]:
+        self,
+        color_msg: Image,
+        depth_msg: Image,
+        camera_info: CameraInfo,
+    ) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        float,
+        o3d.camera.PinholeCameraIntrinsic,
+    ]:
         color_rgb = self._color_to_rgb(color_msg)
-        depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
-        depth = np.asarray(depth)
-        if depth.ndim != 2:
-            raise ValueError(f"Expected one-channel depth image, got shape {depth.shape}")
 
+        depth = self.bridge.imgmsg_to_cv2(
+            depth_msg,
+            desired_encoding="passthrough",
+        )
+        depth = np.asarray(depth)
+
+        if depth.ndim != 2:
+            raise ValueError(
+                f"Expected one-channel depth image, got shape {depth.shape}"
+            )
+
+        self.get_logger().info(
+            f"Depth input: encoding={depth_msg.encoding}, "
+            f"dtype={depth.dtype}, dtype.str={depth.dtype.str}, "
+            f"shape={depth.shape}"
+        )
+
+        # Determine depth units separately from the dtype conversion.
         override = float(self._p("depth_scale_override"))
+
         if override > 0.0:
             depth_scale = override
-        elif depth_msg.encoding in ("16UC1", "mono16") or depth.dtype == np.uint16:
+        elif depth_msg.encoding in ("16UC1", "mono16"):
             depth_scale = 1000.0
-        elif depth_msg.encoding == "32FC1" or depth.dtype == np.float32:
+        elif depth_msg.encoding == "32FC1":
+            depth_scale = 1.0
+        elif np.issubdtype(depth.dtype, np.unsignedinteger):
+            depth_scale = 1000.0
+        elif np.issubdtype(depth.dtype, np.floating):
             depth_scale = 1.0
         else:
             raise ValueError(
-                f"Unsupported depth encoding '{depth_msg.encoding}' / dtype {depth.dtype}. "
-                "Set depth_scale_override if the units are known."
+                f"Unsupported depth encoding '{depth_msg.encoding}' / "
+                f"dtype {depth.dtype}. Set depth_scale_override if the "
+                "depth units are known."
             )
+
+        # Normalize to an Open3D-supported, native-endian dtype.
+        if depth_msg.encoding in ("16UC1", "mono16"):
+            depth = depth.astype(np.uint16, copy=False)
+        elif depth_msg.encoding == "32FC1":
+            depth = depth.astype(np.float32, copy=False)
+        elif np.issubdtype(depth.dtype, np.floating):
+            depth = depth.astype(np.float32, copy=False)
+        elif np.issubdtype(depth.dtype, np.integer):
+            if np.any(depth < 0):
+                raise ValueError(
+                    f"Depth image has negative integer values with dtype {depth.dtype}"
+                )
+            depth = depth.astype(np.uint16, copy=False)
+        else:
+            raise ValueError(
+                f"Cannot convert depth dtype {depth.dtype} for Open3D"
+            )
+
+        # Ensure native byte order. Some ROS image buffers may be big-endian.
+        if not depth.dtype.isnative:
+            depth = depth.byteswap().view(depth.dtype.newbyteorder("="))
+
+        depth = np.ascontiguousarray(depth)
 
         if color_rgb.shape[:2] != depth.shape[:2]:
             raise ValueError(
@@ -415,20 +494,44 @@ class TreePointCloudReconstructor(Node):
                 f"color={color_rgb.shape[:2]}, depth={depth.shape[:2]}"
             )
 
-        depth = depth.copy()
         depth_m = depth.astype(np.float32) / depth_scale
+
         valid = np.isfinite(depth_m)
         valid &= depth_m >= float(self._p("min_depth_m"))
         valid &= depth_m <= float(self._p("max_depth_m"))
+
         depth[~valid] = 0
 
         height, width = depth.shape
-        fx, fy = float(camera_info.k[0]), float(camera_info.k[4])
-        cx, cy = float(camera_info.k[2]), float(camera_info.k[5])
+        fx = float(camera_info.k[0])
+        fy = float(camera_info.k[4])
+        cx = float(camera_info.k[2])
+        cy = float(camera_info.k[5])
+
         if fx <= 0.0 or fy <= 0.0:
             raise ValueError("CameraInfo contains invalid focal lengths")
-        intrinsic = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
-        return np.ascontiguousarray(color_rgb), np.ascontiguousarray(depth), depth_scale, intrinsic
+
+        intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            width,
+            height,
+            fx,
+            fy,
+            cx,
+            cy,
+        )
+
+        self.get_logger().info(
+            f"Depth normalized: dtype={depth.dtype}, "
+            f"dtype.str={depth.dtype.str}, contiguous={depth.flags.c_contiguous}, "
+            f"depth_scale={depth_scale}"
+        )
+
+        return (
+            np.ascontiguousarray(color_rgb, dtype=np.uint8),
+            depth,
+            depth_scale,
+            intrinsic,
+        )
 
     def _color_to_rgb(self, msg: Image) -> np.ndarray:
         image = np.asarray(self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough"))
@@ -449,22 +552,92 @@ class TreePointCloudReconstructor(Node):
         if rgb.dtype != np.uint8:
             rgb = np.clip(rgb, 0, 255).astype(np.uint8)
         return rgb
-
+    
     def _rgbd_to_cloud(
-        self,
-        color_rgb: np.ndarray,
-        depth_array: np.ndarray,
-        depth_scale: float,
-        intrinsic: o3d.camera.PinholeCameraIntrinsic,
-    ) -> o3d.geometry.PointCloud:
-        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            color=o3d.geometry.Image(color_rgb),
-            depth=o3d.geometry.Image(depth_array),
-            depth_scale=depth_scale,
-            depth_trunc=float(self._p("max_depth_m")),
-            convert_rgb_to_intensity=False,
+    self,
+    color_rgb: np.ndarray,
+    depth_array: np.ndarray,
+    depth_scale: float,
+    intrinsic: o3d.camera.PinholeCameraIntrinsic,
+) -> o3d.geometry.PointCloud:
+        color_rgb = np.asarray(color_rgb, dtype=np.uint8)
+        depth_array = np.asarray(depth_array)
+
+        if depth_array.ndim != 2:
+            raise ValueError(
+                f"Depth image must be 2D, got shape {depth_array.shape}"
+            )
+
+        if color_rgb.ndim != 3 or color_rgb.shape[2] != 3:
+            raise ValueError(
+                f"Color image must have shape HxWx3, got {color_rgb.shape}"
+            )
+
+        if color_rgb.shape[:2] != depth_array.shape:
+            raise ValueError(
+                f"Color/depth size mismatch: "
+                f"color={color_rgb.shape[:2]}, depth={depth_array.shape}"
+            )
+
+        if depth_scale <= 0.0:
+            raise ValueError(f"Invalid depth scale: {depth_scale}")
+
+        # Convert the raw depth units into meters.
+        depth_m = depth_array.astype(np.float32) / float(depth_scale)
+
+        height, width = depth_m.shape
+
+        intrinsic_matrix = intrinsic.intrinsic_matrix
+        fx = float(intrinsic_matrix[0, 0])
+        fy = float(intrinsic_matrix[1, 1])
+        cx = float(intrinsic_matrix[0, 2])
+        cy = float(intrinsic_matrix[1, 2])
+
+        if fx <= 0.0 or fy <= 0.0:
+            raise ValueError(
+                f"Invalid camera intrinsics: fx={fx}, fy={fy}"
+            )
+
+        # Pixel coordinates.
+        u, v = np.meshgrid(
+            np.arange(width, dtype=np.float32),
+            np.arange(height, dtype=np.float32),
         )
-        return o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic)
+
+        valid = np.isfinite(depth_m)
+        valid &= depth_m > 0.0
+        valid &= depth_m >= float(self._p("min_depth_m"))
+        valid &= depth_m <= float(self._p("max_depth_m"))
+
+        z = depth_m[valid]
+
+        if z.size == 0:
+            return o3d.geometry.PointCloud()
+
+        # Pinhole-camera back-projection:
+        # X = (u - cx) * Z / fx
+        # Y = (v - cy) * Z / fy
+        # Z = depth
+        x = (u[valid] - cx) * z / fx
+        y = (v[valid] - cy) * z / fy
+
+        points = np.column_stack((x, y, z)).astype(
+            np.float64,
+            copy=False,
+        )
+
+        # Open3D stores colors as floating-point RGB values in [0, 1].
+        colors = color_rgb[valid].astype(np.float64) / 255.0
+
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(
+            np.ascontiguousarray(points)
+        )
+        cloud.colors = o3d.utility.Vector3dVector(
+            np.ascontiguousarray(colors)
+        )
+
+        return cloud
 
     def _filter_cloud(self, cloud: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
         voxel = float(self._p("local_voxel_size_m"))
