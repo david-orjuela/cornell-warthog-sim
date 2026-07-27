@@ -60,8 +60,8 @@ tree_point_cloud_reconstructor:
     # Axis-aligned X/Y/Z dimensions in target_frame, not camera-frame pixels.
     target_box_size_m: [1.0, 1.0, 1.5]
 
-    local_voxel_size_m: 0.004
-    global_voxel_size_m: 0.004
+    local_voxel_size_m: 0.003
+    global_voxel_size_m: 0.003
     outlier_removal_enabled: true
     outlier_filter_mode: statistical  # none | radius | statistical
     outlier_radius_m: 0.020

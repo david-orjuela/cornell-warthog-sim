@@ -20,9 +20,18 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import open3d as o3d
 
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
 
 PROFILE_NAMES = ("none", "current_radius", "dawood_radius", "statistical")
 SCALE_NAMES = ("SN3", "SN2", "SN1", "SN0")
+REGISTRATION_MODES = ("tf_only", "tf_icp")
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,7 +65,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-icp",
         action="store_true",
-        help="Use TF-only fusion for every profile.",
+        help=(
+            "Deprecated compatibility option: run TF-only fusion. "
+            "Cannot be combined with --registration-modes."
+        ),
+    )
+    parser.add_argument(
+        "--registration-modes",
+        nargs="+",
+        choices=REGISTRATION_MODES,
+        default=None,
+        help=(
+            "Registration variants to replay. Default: tf_only tf_icp. "
+            "Both variants consume the identical selected captures."
+        ),
     )
     parser.add_argument(
         "--local-voxel-size-m",
@@ -69,6 +91,36 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="Override the global voxel size saved in run_config.json.",
+    )
+    parser.add_argument(
+        "--closure-pairs",
+        default=None,
+        help=(
+            "Optional comma-separated request-id pairs for row-center closure, "
+            "for example '3:12,13:22,23:32'. By default, repeated TF poses "
+            "are detected automatically."
+        ),
+    )
+    parser.add_argument(
+        "--closure-translation-tolerance-m",
+        type=float,
+        default=0.005,
+        help="Maximum TF translation difference for automatic closure detection.",
+    )
+    parser.add_argument(
+        "--closure-rotation-tolerance-deg",
+        type=float,
+        default=1.0,
+        help="Maximum TF rotation difference for automatic closure detection.",
+    )
+    parser.add_argument(
+        "--closure-min-frame-gap",
+        type=int,
+        default=8,
+        help=(
+            "Minimum frame-index gap for automatic row-center closure "
+            "detection (default: 8)."
+        ),
     )
     return parser.parse_args()
 
@@ -284,6 +336,74 @@ def correction_is_sane(
     )
 
 
+def validate_transform(value: Any, description: str) -> np.ndarray:
+    transform = np.asarray(value, dtype=np.float64)
+    if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+        raise ValueError(f"{description} is not a finite 4x4 transform")
+    return transform
+
+
+def selected_tf_transform(metadata: Dict[str, Any]) -> Optional[np.ndarray]:
+    """Return target<-camera TF saved for the selected burst sample."""
+
+    direct = metadata.get("tf_target_from_camera")
+    if direct is not None:
+        return validate_transform(
+            direct,
+            f"capture {metadata.get('request_id')} tf_target_from_camera",
+        )
+
+    samples = metadata.get("samples")
+    if not isinstance(samples, list) or not samples:
+        return None
+    selected_index = int(
+        metadata.get("selected_sample_index", len(samples) // 2)
+    )
+    if selected_index < 0 or selected_index >= len(samples):
+        raise ValueError(
+            f"Capture {metadata.get('request_id')} has invalid "
+            f"selected_sample_index={selected_index}"
+        )
+    value = samples[selected_index].get("tf_target_from_camera")
+    if value is None:
+        return None
+    return validate_transform(
+        value,
+        f"capture {metadata.get('request_id')} selected-sample TF",
+    )
+
+
+def rotation_angle_deg(rotation: np.ndarray) -> float:
+    trace_term = float((np.trace(rotation) - 1.0) / 2.0)
+    return math.degrees(math.acos(float(np.clip(trace_term, -1.0, 1.0))))
+
+
+def rotation_matrix_to_rpy_deg(rotation: np.ndarray) -> Tuple[float, float, float]:
+    """Return fixed-axis XYZ roll, pitch, yaw in degrees."""
+
+    sy = math.hypot(float(rotation[0, 0]), float(rotation[1, 0]))
+    singular = sy < 1e-9
+    if not singular:
+        roll = math.atan2(float(rotation[2, 1]), float(rotation[2, 2]))
+        pitch = math.atan2(-float(rotation[2, 0]), sy)
+        yaw = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
+    else:
+        roll = math.atan2(-float(rotation[1, 2]), float(rotation[1, 1]))
+        pitch = math.atan2(-float(rotation[2, 0]), sy)
+        yaw = 0.0
+    return tuple(math.degrees(value) for value in (roll, pitch, yaw))
+
+
+def relative_pose_error(
+    first: np.ndarray, second: np.ndarray
+) -> Tuple[float, float]:
+    relative = np.linalg.inv(first) @ second
+    return (
+        float(np.linalg.norm(relative[:3, 3])),
+        rotation_angle_deg(relative[:3, :3]),
+    )
+
+
 def normalized_scales(
     run_config: Dict[str, Any]
 ) -> Dict[str, Dict[str, float]]:
@@ -298,9 +418,12 @@ def fuse_profile(
     profile_name: str,
     captures: Iterable[Dict[str, Any]],
     run_config: Dict[str, Any],
-    use_icp: bool,
+    registration_mode: str,
     output_dir: Path,
 ) -> Dict[str, Any]:
+    if registration_mode not in REGISTRATION_MODES:
+        raise ValueError(f"Unsupported registration mode: {registration_mode}")
+    use_icp = registration_mode == "tf_icp"
     parameters = run_config["parameters"]
     profile = profile_parameters(profile_name, parameters)
     scales = normalized_scales(run_config)
@@ -312,8 +435,9 @@ def fuse_profile(
     rmses = []
     start = time.perf_counter()
 
-    for metadata in captures:
+    for frame_index, metadata in enumerate(captures, start=1):
         request_id = int(metadata["request_id"])
+        tf_transform = selected_tf_transform(metadata)
         cloud = o3d.io.read_point_cloud(metadata["_cloud_path"])
         raw_points = len(cloud.points)
         cloud = crop_saved_cloud(cloud, metadata)
@@ -379,8 +503,20 @@ def fuse_profile(
         else:
             rejected += 1
 
+        correction_translation = transform[:3, 3]
+        correction_rpy_deg = rotation_matrix_to_rpy_deg(transform[:3, :3])
+        correction_translation_m = float(
+            np.linalg.norm(correction_translation)
+        )
+        correction_rotation_deg = rotation_angle_deg(transform[:3, :3])
+        final_pose = (
+            transform @ tf_transform
+            if tf_transform is not None
+            else None
+        )
         capture_results.append(
             {
+                "frame_index": frame_index,
                 "request_id": request_id,
                 "accepted": is_accepted,
                 "reason": reason,
@@ -390,6 +526,22 @@ def fuse_profile(
                 "fitness": fitness,
                 "inlier_rmse_m": rmse,
                 "icp_correction": transform.tolist(),
+                "icp_correction_translation_m": (
+                    correction_translation.tolist()
+                ),
+                "icp_correction_translation_norm_m": (
+                    correction_translation_m
+                ),
+                "icp_correction_rpy_deg": list(correction_rpy_deg),
+                "icp_correction_rotation_deg": correction_rotation_deg,
+                "tf_target_from_camera": (
+                    tf_transform.tolist()
+                    if tf_transform is not None
+                    else None
+                ),
+                "final_target_from_camera": (
+                    final_pose.tolist() if final_pose is not None else None
+                ),
             }
         )
 
@@ -411,6 +563,7 @@ def fuse_profile(
         "global_voxel_size_m": float(
             parameters.get("global_voxel_size_m", 0.005)
         ),
+        "registration_mode": registration_mode,
         "use_icp": use_icp,
         "capture_count": accepted + rejected,
         "accepted_captures": accepted,
@@ -436,9 +589,420 @@ def fuse_profile(
     return metrics
 
 
+def write_frame_metrics_csv(
+    path: Path, captures: List[Dict[str, Any]]
+) -> None:
+    fieldnames = [
+        "frame_index",
+        "request_id",
+        "accepted",
+        "reason",
+        "correction_x_mm",
+        "correction_y_mm",
+        "correction_z_mm",
+        "correction_translation_mm",
+        "correction_roll_deg",
+        "correction_pitch_deg",
+        "correction_yaw_deg",
+        "correction_rotation_deg",
+        "fitness",
+        "inlier_rmse_mm",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for capture in captures:
+            translation = capture["icp_correction_translation_m"]
+            roll, pitch, yaw = capture["icp_correction_rpy_deg"]
+            rmse = capture.get("inlier_rmse_m")
+            writer.writerow(
+                {
+                    "frame_index": capture["frame_index"],
+                    "request_id": capture["request_id"],
+                    "accepted": capture["accepted"],
+                    "reason": capture["reason"],
+                    "correction_x_mm": 1000.0 * translation[0],
+                    "correction_y_mm": 1000.0 * translation[1],
+                    "correction_z_mm": 1000.0 * translation[2],
+                    "correction_translation_mm": (
+                        1000.0
+                        * capture["icp_correction_translation_norm_m"]
+                    ),
+                    "correction_roll_deg": roll,
+                    "correction_pitch_deg": pitch,
+                    "correction_yaw_deg": yaw,
+                    "correction_rotation_deg": (
+                        capture["icp_correction_rotation_deg"]
+                    ),
+                    "fitness": capture.get("fitness"),
+                    "inlier_rmse_mm": (
+                        None if rmse is None else 1000.0 * rmse
+                    ),
+                }
+            )
+
+
+def save_diagnostic_plots(
+    output_dir: Path,
+    profile_name: str,
+    captures: List[Dict[str, Any]],
+) -> None:
+    if plt is None:
+        print(
+            "WARNING: matplotlib is not installed; diagnostic CSV files "
+            "were written, but PNG plots were skipped."
+        )
+        return
+
+    frames = np.asarray(
+        [capture["frame_index"] for capture in captures], dtype=np.int64
+    )
+    translations = 1000.0 * np.asarray(
+        [
+            capture["icp_correction_translation_m"]
+            for capture in captures
+        ],
+        dtype=np.float64,
+    )
+    translation_norms = 1000.0 * np.asarray(
+        [
+            capture["icp_correction_translation_norm_m"]
+            for capture in captures
+        ],
+        dtype=np.float64,
+    )
+    rotations = np.asarray(
+        [capture["icp_correction_rpy_deg"] for capture in captures],
+        dtype=np.float64,
+    )
+    rotation_norms = np.asarray(
+        [capture["icp_correction_rotation_deg"] for capture in captures],
+        dtype=np.float64,
+    )
+    fitness = np.asarray(
+        [
+            np.nan if capture.get("fitness") is None else capture["fitness"]
+            for capture in captures
+        ],
+        dtype=np.float64,
+    )
+    rmse_mm = 1000.0 * np.asarray(
+        [
+            (
+                np.nan
+                if capture.get("inlier_rmse_m") is None
+                else capture["inlier_rmse_m"]
+            )
+            for capture in captures
+        ],
+        dtype=np.float64,
+    )
+
+    figure, axis = plt.subplots(figsize=(10, 5.5))
+    axis.plot(frames, translations[:, 0], label="X", marker=".", linewidth=1)
+    axis.plot(frames, translations[:, 1], label="Y", marker=".", linewidth=1)
+    axis.plot(frames, translations[:, 2], label="Z", marker=".", linewidth=1)
+    axis.plot(
+        frames,
+        translation_norms,
+        label="Magnitude",
+        color="black",
+        linewidth=2,
+    )
+    axis.axhline(0.0, color="0.65", linewidth=0.8)
+    axis.set(
+        xlabel="Frame index",
+        ylabel="ICP translation correction (mm)",
+        title=f"{profile_name}: translation correction versus frame",
+    )
+    axis.grid(alpha=0.25)
+    axis.legend(ncol=4)
+    figure.tight_layout()
+    figure.savefig(output_dir / "translation_correction_vs_frame.png", dpi=180)
+    plt.close(figure)
+
+    figure, axis = plt.subplots(figsize=(10, 5.5))
+    axis.plot(frames, rotations[:, 0], label="Roll", marker=".", linewidth=1)
+    axis.plot(frames, rotations[:, 1], label="Pitch", marker=".", linewidth=1)
+    axis.plot(frames, rotations[:, 2], label="Yaw", marker=".", linewidth=1)
+    axis.plot(
+        frames,
+        rotation_norms,
+        label="Angle magnitude",
+        color="black",
+        linewidth=2,
+    )
+    axis.axhline(0.0, color="0.65", linewidth=0.8)
+    axis.set(
+        xlabel="Frame index",
+        ylabel="ICP rotation correction (deg)",
+        title=f"{profile_name}: rotation correction versus frame",
+    )
+    axis.grid(alpha=0.25)
+    axis.legend(ncol=4)
+    figure.tight_layout()
+    figure.savefig(output_dir / "rotation_correction_vs_frame.png", dpi=180)
+    plt.close(figure)
+
+    figure, fitness_axis = plt.subplots(figsize=(10, 5.5))
+    rmse_axis = fitness_axis.twinx()
+    fitness_line = fitness_axis.plot(
+        frames,
+        fitness,
+        color="tab:blue",
+        marker="o",
+        markersize=3,
+        label="Fitness",
+    )
+    rmse_line = rmse_axis.plot(
+        frames,
+        rmse_mm,
+        color="tab:red",
+        marker="s",
+        markersize=3,
+        label="Inlier RMSE",
+    )
+    fitness_axis.set(
+        xlabel="Frame index",
+        ylabel="ICP fitness",
+        title=f"{profile_name}: ICP quality versus frame",
+    )
+    rmse_axis.set_ylabel("ICP inlier RMSE (mm)")
+    fitness_axis.grid(alpha=0.25)
+    lines = fitness_line + rmse_line
+    fitness_axis.legend(lines, [line.get_label() for line in lines])
+    figure.tight_layout()
+    figure.savefig(output_dir / "fitness_rmse_vs_frame.png", dpi=180)
+    plt.close(figure)
+
+
+def parse_closure_pairs(value: Optional[str]) -> Optional[List[Tuple[int, int]]]:
+    if value is None:
+        return None
+    pairs: List[Tuple[int, int]] = []
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.split(":")
+        if len(parts) != 2:
+            raise ValueError(
+                f"Invalid closure pair {token!r}; expected START:END"
+            )
+        first, second = (int(part) for part in parts)
+        if first == second:
+            raise ValueError(f"Closure pair {token!r} repeats one request id")
+        pairs.append((first, second))
+    if not pairs:
+        raise ValueError("--closure-pairs did not contain any pairs")
+    return pairs
+
+
+def detect_closure_pairs(
+    captures: List[Dict[str, Any]],
+    translation_tolerance_m: float,
+    rotation_tolerance_deg: float,
+    minimum_frame_gap: int,
+) -> List[Tuple[int, int]]:
+    """Find later revisits of a TF pose, preferring the latest valid start."""
+
+    detected: List[Tuple[int, int]] = []
+    for end_index, end in enumerate(captures):
+        if not end.get("accepted") or end.get("tf_target_from_camera") is None:
+            continue
+        end_pose = validate_transform(
+            end["tf_target_from_camera"],
+            f"capture {end['request_id']} TF",
+        )
+        matching_starts: List[Dict[str, Any]] = []
+        for start in captures[:end_index]:
+            if (
+                not start.get("accepted")
+                or start.get("tf_target_from_camera") is None
+                or (
+                    int(end["frame_index"]) - int(start["frame_index"])
+                    < minimum_frame_gap
+                )
+            ):
+                continue
+            start_pose = validate_transform(
+                start["tf_target_from_camera"],
+                f"capture {start['request_id']} TF",
+            )
+            translation_m, rotation_deg = relative_pose_error(
+                start_pose, end_pose
+            )
+            if (
+                translation_m <= translation_tolerance_m
+                and rotation_deg <= rotation_tolerance_deg
+            ):
+                matching_starts.append(start)
+        if matching_starts:
+            # For Row 0 this chooses frame 3 rather than setup frame 1.
+            start = max(
+                matching_starts, key=lambda item: int(item["frame_index"])
+            )
+            detected.append(
+                (int(start["request_id"]), int(end["request_id"]))
+            )
+    return detected
+
+
+def calculate_closure_errors(
+    captures: List[Dict[str, Any]],
+    pairs: List[Tuple[int, int]],
+) -> List[Dict[str, Any]]:
+    by_request = {int(item["request_id"]): item for item in captures}
+    closures: List[Dict[str, Any]] = []
+    for row_index, (start_id, end_id) in enumerate(pairs):
+        if start_id not in by_request or end_id not in by_request:
+            raise ValueError(
+                f"Closure pair {start_id}:{end_id} is not present in the "
+                "selected captures"
+            )
+        start = by_request[start_id]
+        end = by_request[end_id]
+        if (
+            start.get("tf_target_from_camera") is None
+            or end.get("tf_target_from_camera") is None
+        ):
+            raise ValueError(
+                f"Closure pair {start_id}:{end_id} has no saved TF pose"
+            )
+        if (
+            start.get("final_target_from_camera") is None
+            or end.get("final_target_from_camera") is None
+        ):
+            raise ValueError(
+                f"Closure pair {start_id}:{end_id} has no final camera pose"
+            )
+        tf_translation_m, tf_rotation_deg = relative_pose_error(
+            validate_transform(
+                start["tf_target_from_camera"], f"capture {start_id} TF"
+            ),
+            validate_transform(
+                end["tf_target_from_camera"], f"capture {end_id} TF"
+            ),
+        )
+        final_translation_m, final_rotation_deg = relative_pose_error(
+            validate_transform(
+                start["final_target_from_camera"],
+                f"capture {start_id} final pose",
+            ),
+            validate_transform(
+                end["final_target_from_camera"],
+                f"capture {end_id} final pose",
+            ),
+        )
+        closures.append(
+            {
+                "row_index": row_index,
+                "start_request_id": start_id,
+                "end_request_id": end_id,
+                "frame_gap": (
+                    int(end["frame_index"]) - int(start["frame_index"])
+                ),
+                "tf_translation_error_mm": 1000.0 * tf_translation_m,
+                "tf_rotation_error_deg": tf_rotation_deg,
+                "tf_icp_translation_error_mm": (
+                    1000.0 * final_translation_m
+                ),
+                "tf_icp_rotation_error_deg": final_rotation_deg,
+                "translation_error_change_mm": (
+                    1000.0 * (final_translation_m - tf_translation_m)
+                ),
+                "rotation_error_change_deg": (
+                    final_rotation_deg - tf_rotation_deg
+                ),
+            }
+        )
+    return closures
+
+
+def write_closure_csv(path: Path, closures: List[Dict[str, Any]]) -> None:
+    fieldnames = [
+        "row_index",
+        "start_request_id",
+        "end_request_id",
+        "frame_gap",
+        "tf_translation_error_mm",
+        "tf_rotation_error_deg",
+        "tf_icp_translation_error_mm",
+        "tf_icp_rotation_error_deg",
+        "translation_error_change_mm",
+        "rotation_error_change_deg",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(closures)
+
+
+def save_closure_plot(
+    path: Path, profile_name: str, closures: List[Dict[str, Any]]
+) -> None:
+    if plt is None or not closures:
+        return
+    labels = [
+        f"{item['start_request_id']}->{item['end_request_id']}"
+        for item in closures
+    ]
+    positions = np.arange(len(closures), dtype=np.float64)
+    width = 0.36
+    tf_translation = [
+        item["tf_translation_error_mm"] for item in closures
+    ]
+    corrected_translation = [
+        item["tf_icp_translation_error_mm"] for item in closures
+    ]
+    tf_rotation = [item["tf_rotation_error_deg"] for item in closures]
+    corrected_rotation = [
+        item["tf_icp_rotation_error_deg"] for item in closures
+    ]
+
+    figure, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    axes[0].bar(
+        positions - width / 2,
+        tf_translation,
+        width,
+        label="TF-only pose",
+    )
+    axes[0].bar(
+        positions + width / 2,
+        corrected_translation,
+        width,
+        label="TF+ICP pose",
+    )
+    axes[0].set_ylabel("Translation closure (mm)")
+    axes[0].grid(axis="y", alpha=0.25)
+    axes[0].legend()
+
+    axes[1].bar(
+        positions - width / 2,
+        tf_rotation,
+        width,
+        label="TF-only pose",
+    )
+    axes[1].bar(
+        positions + width / 2,
+        corrected_rotation,
+        width,
+        label="TF+ICP pose",
+    )
+    axes[1].set_ylabel("Rotation closure (deg)")
+    axes[1].set_xlabel("Repeated row-center request IDs")
+    axes[1].set_xticks(positions, labels)
+    axes[1].grid(axis="y", alpha=0.25)
+    figure.suptitle(f"{profile_name}: row-center closure errors")
+    figure.tight_layout()
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+
+
 def write_comparison_csv(path: Path, results: List[Dict[str, Any]]) -> None:
     fieldnames = [
         "profile",
+        "registration_mode",
         "use_icp",
         "capture_count",
         "accepted_captures",
@@ -459,6 +1023,21 @@ def write_comparison_csv(path: Path, results: List[Dict[str, Any]]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.no_icp and args.registration_modes is not None:
+        raise ValueError(
+            "--no-icp cannot be combined with --registration-modes"
+        )
+    registration_modes = (
+        ["tf_only"]
+        if args.no_icp
+        else (
+            args.registration_modes
+            if args.registration_modes is not None
+            else ["tf_only", "tf_icp"]
+        )
+    )
+    manual_closure_pairs = parse_closure_pairs(args.closure_pairs)
+
     scan_dir = args.scan_dir.expanduser().resolve()
     run_config_path = scan_dir / "run_config.json"
     if not run_config_path.is_file():
@@ -470,16 +1049,21 @@ def main() -> None:
             f"No raw/capture_*/raw_target_cloud.ply inputs found in {scan_dir}"
         )
     run_config = load_json(run_config_path)
-    parameters = run_config["parameters"]
+    parameters = run_config["parameters"].copy()
+    run_config["parameters"] = parameters
 
     if args.local_voxel_size_m is not None:
-            parameters["local_voxel_size_m"] = args.local_voxel_size_m
-    
+        parameters["local_voxel_size_m"] = args.local_voxel_size_m
+
     if args.global_voxel_size_m is not None:
         parameters["global_voxel_size_m"] = args.global_voxel_size_m
 
-    local_voxel_mm = parameters["local_voxel_size_m"] * 1e3
-    global_voxel_mm = parameters["global_voxel_size_m"] * 1e3
+    local_voxel_m = float(parameters.get("local_voxel_size_m", 0.004))
+    global_voxel_m = float(parameters.get("global_voxel_size_m", 0.004))
+    if local_voxel_m < 0.0 or global_voxel_m < 0.0:
+        raise ValueError("Voxel sizes must be non-negative")
+    local_voxel_mm = local_voxel_m * 1e3
+    global_voxel_mm = global_voxel_m * 1e3
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
 
@@ -499,20 +1083,97 @@ def main() -> None:
 
     output_root.mkdir(parents=True, exist_ok=False)
 
-    use_icp = bool(parameters.get("use_icp", True)) and not args.no_icp
+    manifest = {
+        "source_scan_dir": str(scan_dir),
+        "request_ids": [int(item["request_id"]) for item in captures],
+        "capture_metadata_paths": [
+            item["_metadata_path"] for item in captures
+        ],
+        "profiles": list(args.profiles),
+        "registration_modes": registration_modes,
+        "local_voxel_size_m": local_voxel_m,
+        "global_voxel_size_m": global_voxel_m,
+        "identical_capture_policy": (
+            "Every profile and registration mode replays this exact ordered "
+            "selected-capture list."
+        ),
+    }
+    with open(
+        output_root / "replay_manifest.json", "w", encoding="utf-8"
+    ) as handle:
+        json.dump(manifest, handle, indent=2)
 
-    results = []
+    results: List[Dict[str, Any]] = []
     for profile_name in args.profiles:
-        print(f"[{profile_name}] rebuilding {len(captures)} captures...")
-        results.append(
-            fuse_profile(
+        profile_results: Dict[str, Dict[str, Any]] = {}
+        for registration_mode in registration_modes:
+            print(
+                f"[{profile_name}/{registration_mode}] rebuilding "
+                f"{len(captures)} captures..."
+            )
+            result = fuse_profile(
                 profile_name=profile_name,
                 captures=captures,
                 run_config=run_config,
-                use_icp=use_icp,
-                output_dir=output_root / profile_name,
+                registration_mode=registration_mode,
+                output_dir=(
+                    output_root / profile_name / registration_mode
+                ),
             )
-        )
+            results.append(result)
+            profile_results[registration_mode] = result
+            write_frame_metrics_csv(
+                output_root
+                / profile_name
+                / registration_mode
+                / "frame_metrics.csv",
+                result["captures"],
+            )
+
+        icp_result = profile_results.get("tf_icp")
+        if icp_result is not None:
+            icp_output_dir = output_root / profile_name / "tf_icp"
+            save_diagnostic_plots(
+                icp_output_dir,
+                profile_name,
+                icp_result["captures"],
+            )
+            try:
+                closure_pairs = (
+                    manual_closure_pairs
+                    if manual_closure_pairs is not None
+                    else detect_closure_pairs(
+                        icp_result["captures"],
+                        args.closure_translation_tolerance_m,
+                        args.closure_rotation_tolerance_deg,
+                        args.closure_min_frame_gap,
+                    )
+                )
+                closures = calculate_closure_errors(
+                    icp_result["captures"], closure_pairs
+                )
+            except ValueError:
+                if manual_closure_pairs is not None:
+                    raise
+                closures = []
+            if closures:
+                closure_path = (
+                    output_root / profile_name / "row_center_closure.csv"
+                )
+                write_closure_csv(closure_path, closures)
+                save_closure_plot(
+                    output_root
+                    / profile_name
+                    / "row_center_closure_errors.png",
+                    profile_name,
+                    closures,
+                )
+            else:
+                print(
+                    f"WARNING: [{profile_name}] no repeated row-center TF "
+                    "poses were detected. Supply --closure-pairs "
+                    "START:END,... if the request IDs are known."
+                )
 
     comparison_path = output_root / "comparison.csv"
     write_comparison_csv(comparison_path, results)
