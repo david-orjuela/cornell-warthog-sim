@@ -15,8 +15,10 @@ import math
 import os
 import time
 import traceback
+import warnings
+from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import cv2
 import message_filters
@@ -34,8 +36,8 @@ from rclpy.qos import (
     qos_profile_sensor_data,
 )
 from rclpy.time import Time
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2
-from std_msgs.msg import Bool, UInt32
+from sensor_msgs.msg import CameraInfo, Image, JointState, PointCloud2
+from std_msgs.msg import Bool, Int32, UInt32
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from reconstruct.pc_utils import o3dpc_to_pointcloud2
@@ -49,6 +51,7 @@ class TreePointCloudReconstructor(Node):
     def __init__(self) -> None:
         super().__init__("tree_point_cloud_reconstructor")
         self._declare_parameters()
+        self._validate_configuration()
 
         self.bridge = CvBridge()
         self.target_frame = self._p("target_frame")
@@ -56,10 +59,11 @@ class TreePointCloudReconstructor(Node):
         self.output_root = Path(os.path.expanduser(self._p("output_root"))).resolve()
         self.scan_id = self._p("scan_id")
         self.scan_dir = self.output_root / self.scan_id
-        self.frames_dir = self.scan_dir / "frames"
-        self.frames_dir.mkdir(parents=True, exist_ok=True)
+        self.raw_dir = self.scan_dir / "raw"
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.global_cloud_path = self.scan_dir / "global_point_cloud.ply"
         self.summary_path = self.scan_dir / "summary.json"
+        self.run_config_path = self.scan_dir / "run_config.json"
 
         self.tf_buffer = Buffer(cache_time=Duration(seconds=30.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -98,13 +102,16 @@ class TreePointCloudReconstructor(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.capture_sub = self.create_subscription(
-            Bool, self._p("capture_topic"), self.capture_alert_callback, control_qos
+            UInt32,
+            self._p("capture_request_topic"),
+            self.capture_request_callback,
+            control_qos,
         )
         self.finished_sub = self.create_subscription(
             Bool, self._p("scan_finished_topic"), self.scan_finished_callback, control_qos
         )
-        self.capture_done_pub = self.create_publisher(
-            UInt32, self._p("capture_done_topic"), control_qos
+        self.capture_result_pub = self.create_publisher(
+            Int32, self._p("capture_result_topic"), control_qos
         )
         self.pcd_pub = self.create_publisher(
             PointCloud2, self._p("output_cloud_topic"), cloud_qos
@@ -112,12 +119,25 @@ class TreePointCloudReconstructor(Node):
         self.original_pcd_pub = self.create_publisher(
             PointCloud2, self._p("original_cloud_topic"), cloud_qos
         )
+        self.latest_joint_state: Optional[JointState] = None
+        self.joint_state_sub = self.create_subscription(
+            JointState,
+            self._p("joint_state_topic"),
+            self._joint_state_callback,
+            qos_profile_sensor_data,
+        )
 
-        self.pending_captures = 1 if bool(self._p("capture_on_start")) else 0
+        self.pending_capture_requests: Deque[Tuple[int, int]] = deque()
+        if bool(self._p("capture_on_start")):
+            self.pending_capture_requests.append((1, self.get_clock().now().nanoseconds))
+        self.active_request_id: Optional[int] = None
+        self.active_request_received_ns = 0
+        self.active_burst: List[Dict[str, Any]] = []
+        self.last_burst_stamp_ns = -1
+        self.capture_attempts: Dict[int, int] = {}
         self.processing = False
-        self.capture_sequence = 0
-        self.frame_index = 0
         self.global_pc = o3d.geometry.PointCloud()
+        self.target_crop_center: Optional[np.ndarray] = None
 
         self.total_frames = 0
         self.accepted_frames = 0
@@ -127,10 +147,11 @@ class TreePointCloudReconstructor(Node):
         self.reconstruction_times_ms: List[float] = []
         self.summary_written = False
         self.registration_scales = self._load_registration_scales()
+        self._write_run_config()
 
         self.get_logger().info(
             "Tree reconstructor ready. Waiting for capture triggers on "
-            f"'{self._p('capture_topic')}'."
+            f"'{self._p('capture_request_topic')}'."
         )
         self.get_logger().info(
             f"RGB-D: {color_topic} + {depth_topic} + {camera_info_topic}"
@@ -144,11 +165,12 @@ class TreePointCloudReconstructor(Node):
             "color_topic": "/sensors/camera_jetson/color/image_raw",
             "depth_topic": "/sensors/camera_jetson/aligned_depth_to_color/image_raw",
             "camera_info_topic": "/sensors/camera_jetson/aligned_depth_to_color/camera_info",
-            "capture_topic": "/capture_alert",
-            "capture_done_topic": "/capture_done",
-            "scan_finished_topic": "/scan_finished",
+            "capture_request_topic": "/tree_scan/capture_request",
+            "capture_result_topic": "/tree_scan/capture_result",
+            "scan_finished_topic": "/tree_scan/scan_finished",
             "output_cloud_topic": "/tree_scan/global_cloud",
             "original_cloud_topic": "/tree_scan/latest_tf_cloud",
+            "joint_state_topic": "/joint_states",
             "target_frame": "base_link",
             "camera_frame_override": "",
             "output_root": "~/tree_scans",
@@ -157,20 +179,34 @@ class TreePointCloudReconstructor(Node):
             "sync_queue_size": 30,
             "sync_slop_sec": 0.08,
             "tf_timeout_sec": 0.75,
-            "min_depth_m": 0.15,
+            "post_request_guard_sec": 0.0,
+            "sensor_clock_warning_sec": 0.25,
+            "depth_burst_size": 5,
+            "depth_burst_min_valid_samples": 2,
+            "burst_pose_translation_tolerance_m": 0.005,
+            "burst_pose_rotation_tolerance_deg": 0.5,
+            "min_depth_m": 0.30,
             "max_depth_m": 2.50,
             "depth_scale_override": 0.0,
+            "target_crop_enabled": False,
+            "target_center_mode": "camera_forward",
+            "target_distance_m": 1.0,
+            "target_center_target_frame_m": [0.0, 0.0, 0.0],
+            "target_box_size_m": [1.0, 1.0, 1.5],
             "local_voxel_size_m": 0.006,
             "global_voxel_size_m": 0.005,
             "outlier_removal_enabled": True,
+            "outlier_filter_mode": "radius",
             "outlier_radius_m": 0.020,
             "outlier_min_neighbors": 6,
+            "statistical_nb_neighbors": 20,
+            "statistical_std_ratio": 2.0,
             "use_icp": True,
             "icp_crop_margin_m": 0.15,
             "icp_min_target_points": 200,
             "max_icp_correction_translation_m": 0.10,
             "max_icp_correction_rotation_deg": 12.0,
-            "save_frames": True,
+            "save_raw_point_clouds": True,
             "publish_original_cloud": True,
             "shutdown_on_scan_finished": False,
         }
@@ -199,6 +235,25 @@ class TreePointCloudReconstructor(Node):
     def _p(self, name: str):
         return self.get_parameter(name).value
 
+    def _validate_configuration(self) -> None:
+        burst_size = int(self.get_parameter("depth_burst_size").value)
+        min_valid = int(
+            self.get_parameter("depth_burst_min_valid_samples").value
+        )
+        if burst_size < 1:
+            raise ValueError("depth_burst_size must be at least 1")
+        if min_valid < 1 or min_valid > burst_size:
+            raise ValueError(
+                "depth_burst_min_valid_samples must be between 1 and "
+                "depth_burst_size"
+            )
+        min_depth = float(self.get_parameter("min_depth_m").value)
+        max_depth = float(self.get_parameter("max_depth_m").value)
+        if min_depth < 0.0 or max_depth <= min_depth:
+            raise ValueError(
+                "Depth limits must satisfy 0 <= min_depth_m < max_depth_m"
+            )
+
     def _load_registration_scales(self) -> Dict[str, Dict[str, float]]:
         scales: Dict[str, Dict[str, float]] = {}
         for name in self.SCALE_NAMES:
@@ -220,12 +275,31 @@ class TreePointCloudReconstructor(Node):
             }
         return scales
 
-    def capture_alert_callback(self, msg: Bool) -> None:
-        if msg.data:
-            self.pending_captures += 1
-            self.get_logger().info(
-                f"Capture requested; pending captures: {self.pending_captures}"
+    def _joint_state_callback(self, msg: JointState) -> None:
+        self.latest_joint_state = msg
+
+    def capture_request_callback(self, msg: UInt32) -> None:
+        request_id = int(msg.data)
+        if request_id <= 0 or request_id > np.iinfo(np.int32).max:
+            self.get_logger().error(
+                f"Ignoring invalid capture request id {request_id}; "
+                "valid ids are 1..2147483647."
             )
+            return
+
+        queued_ids = {item[0] for item in self.pending_capture_requests}
+        if request_id == self.active_request_id or request_id in queued_ids:
+            self.get_logger().warning(
+                f"Ignoring duplicate capture request {request_id}."
+            )
+            return
+
+        received_ns = self.get_clock().now().nanoseconds
+        self.pending_capture_requests.append((request_id, received_ns))
+        self.get_logger().info(
+            f"Capture {request_id} queued; "
+            f"pending={len(self.pending_capture_requests)}."
+        )
 
     def scan_finished_callback(self, msg: Bool) -> None:
         if not msg.data:
@@ -241,12 +315,36 @@ class TreePointCloudReconstructor(Node):
     def rgbd_callback(
         self, color_msg: Image, depth_msg: Image, camera_info: CameraInfo
     ) -> None:
-        if self.pending_captures <= 0 or self.processing:
+        if self.processing:
             return
 
-        self.processing = True
-        start_wall = time.perf_counter()
-        processed = False
+        if self.active_request_id is None:
+            if not self.pending_capture_requests:
+                return
+            (
+                self.active_request_id,
+                self.active_request_received_ns,
+            ) = self.pending_capture_requests.popleft()
+            self.active_burst = []
+            self.last_burst_stamp_ns = -1
+            self.get_logger().info(
+                f"Capture {self.active_request_id}: waiting for "
+                f"{int(self._p('depth_burst_size'))} new synchronized RGB-D frames."
+            )
+
+        stamp_ns = (
+            int(depth_msg.header.stamp.sec) * 1_000_000_000
+            + int(depth_msg.header.stamp.nanosec)
+        )
+        minimum_stamp_ns = self.active_request_received_ns + int(
+            float(self._p("post_request_guard_sec")) * 1.0e9
+        )
+        if stamp_ns <= minimum_stamp_ns:
+            # The synchronizer may still contain frames captured before the request.
+            return
+        if stamp_ns <= self.last_burst_stamp_ns:
+            return
+
         try:
             camera_frame = (
                 self.camera_frame_override
@@ -264,99 +362,254 @@ class TreePointCloudReconstructor(Node):
                 self.target_frame, camera_frame, depth_msg.header.stamp
             )
             if tf_matrix is None:
-                # Keep the capture queued and retry on the next synchronized frame.
+                # Keep the request active and try a later sensor frame.
                 return
 
-            color_rgb, depth_array, depth_scale, intrinsic = self._process_images(
+            color_rgb, depth_array, depth_scale, intrinsic = self._decode_images(
                 color_msg, depth_msg, camera_info
             )
-            self.get_logger().info(
-                f"Depth encoding={depth_msg.encoding}, "
-                f"dtype={depth_array.dtype}, "
-                f"shape={depth_array.shape}, "
-                f"depth_scale={depth_scale}"
+
+            if self.active_burst:
+                first = self.active_burst[0]
+                if (
+                    color_rgb.shape != first["color_rgb"].shape
+                    or depth_array.shape != first["depth_array"].shape
+                    or not math.isclose(
+                        float(depth_scale),
+                        float(first["depth_scale"]),
+                        rel_tol=0.0,
+                        abs_tol=1.0e-12,
+                    )
+                ):
+                    self._finish_active_capture(
+                        accepted=False,
+                        reason="camera stream profile changed inside depth burst",
+                    )
+                    return
+
+            now_ns = self.get_clock().now().nanoseconds
+            sensor_age_sec = (now_ns - stamp_ns) / 1.0e9
+            if not self.active_burst and abs(sensor_age_sec) > float(
+                self._p("sensor_clock_warning_sec")
+            ):
+                self.get_logger().warning(
+                    f"Capture {self.active_request_id}: sensor stamp differs from "
+                    f"this computer by {sensor_age_sec:+.3f} s (includes transport "
+                    "latency). Verify the lab chrony/NTP source on both hosts."
+                )
+
+            self.active_burst.append(
+                {
+                    "color_rgb": color_rgb,
+                    "depth_array": depth_array,
+                    "depth_scale": float(depth_scale),
+                    "intrinsic": intrinsic,
+                    "camera_info": self._camera_info_to_dict(camera_info),
+                    "tf_matrix": tf_matrix,
+                    "camera_frame": camera_frame,
+                    "stamp_ns": stamp_ns,
+                    "stamp_sec": int(depth_msg.header.stamp.sec),
+                    "stamp_nanosec": int(depth_msg.header.stamp.nanosec),
+                    "stamp_msg": depth_msg.header.stamp,
+                    "color_encoding": color_msg.encoding,
+                    "depth_encoding": depth_msg.encoding,
+                    "color_frame_id": color_msg.header.frame_id,
+                    "depth_frame_id": depth_msg.header.frame_id,
+                    "joint_state": self._joint_state_to_dict(
+                        self.latest_joint_state
+                    ),
+                }
             )
-            pcd_camera = self._rgbd_to_cloud(
-                color_rgb, depth_array, depth_scale, intrinsic
-            )
-            if len(pcd_camera.points) == 0:
-                self.get_logger().warning("Captured RGB-D frame produced no points.")
+            self.last_burst_stamp_ns = stamp_ns
+
+            burst_size = int(self._p("depth_burst_size"))
+            if len(self.active_burst) < burst_size:
                 return
 
-            pcd_target = copy.deepcopy(pcd_camera)
-            pcd_target.transform(tf_matrix)
-
-            if bool(self._p("publish_original_cloud")):
-                original_msg = o3dpc_to_pointcloud2(
-                    pcd_target, self.target_frame, depth_msg.header.stamp
-                )
-                self.original_pcd_pub.publish(original_msg)
-
-            accepted, icp_transform, fitness, rmse, filtered_cloud = self._fuse_frame(
-                pcd_target
-            )
-
-            self.total_frames += 1
-            if accepted:
-                self.accepted_frames += 1
-                if fitness is not None:
-                    self.icp_fitnesses.append(float(fitness))
-                if rmse is not None:
-                    self.icp_rmses.append(float(rmse))
-            else:
-                self.rejected_frames += 1
-
-            if bool(self._p("save_frames")):
-                self._save_frame_data(
-                    color_rgb=color_rgb,
-                    depth_array=depth_array,
-                    intrinsic=intrinsic,
-                    tf_matrix=tf_matrix,
-                    icp_transform=icp_transform,
-                    camera_frame=camera_frame,
-                    accepted=accepted,
-                    fitness=fitness,
-                    rmse=rmse,
-                    color_encoding=color_msg.encoding,
-                    depth_encoding=depth_msg.encoding,
-                )
-
-            self._publish_global_cloud(depth_msg.header.stamp)
-            self._write_global_cloud()
-
-            elapsed_ms = (time.perf_counter() - start_wall) * 1000.0
-            self.reconstruction_times_ms.append(elapsed_ms)
-            status = "accepted" if accepted else "rejected"
-            if accepted and fitness is None:
-                metric_text = "first frame / TF only"
-            elif not accepted and len(filtered_cloud.points) == 0:
-                metric_text = "empty cloud after filtering"
-            elif fitness is None:
-                metric_text = "rejected before ICP"
-            else:
-                metric_text = (
-                    f"fitness={fitness:.3f}, "
-                    f"rmse={rmse * 1000.0:.1f} mm"
-                )
-            self.get_logger().info(
-                f"Capture {self.capture_sequence + 1} {status}: {metric_text}; "
-                f"global points={len(self.global_pc.points)}; {elapsed_ms:.1f} ms"
-            )
-            processed = True
+            self.processing = True
+            accepted, reason = self._process_active_burst()
+            self._finish_active_capture(accepted=accepted, reason=reason)
         except CvBridgeError as exc:
             self.get_logger().error(f"cv_bridge conversion failed: {exc}")
-        except Exception as exc:  # Keep node alive and preserve queued capture.
+        except Exception as exc:
             self.get_logger().error(
                 f"RGB-D reconstruction failed: {exc}\n{traceback.format_exc()}"
             )
-        finally:
-            if processed:
-                self.pending_captures = max(0, self.pending_captures - 1)
-                self.capture_sequence += 1
-                done = UInt32()
-                done.data = self.capture_sequence
-                self.capture_done_pub.publish(done)
+            if self.active_request_id is not None and len(self.active_burst) >= int(
+                self._p("depth_burst_size")
+            ):
+                self._finish_active_capture(
+                    accepted=False,
+                    reason=f"processing exception: {exc}",
+                )
+
+    def _finish_active_capture(self, *, accepted: bool, reason: str) -> None:
+        request_id = self.active_request_id
+        if request_id is None:
             self.processing = False
+            return
+
+        result = Int32()
+        result.data = request_id if accepted else -request_id
+        self.capture_result_pub.publish(result)
+        status = "accepted" if accepted else "rejected"
+        self.get_logger().info(
+            f"Capture {request_id} {status}; result={result.data}; reason={reason}."
+        )
+        self.active_request_id = None
+        self.active_request_received_ns = 0
+        self.active_burst = []
+        self.last_burst_stamp_ns = -1
+        self.processing = False
+
+    def _process_active_burst(self) -> Tuple[bool, str]:
+        if self.active_request_id is None or not self.active_burst:
+            return False, "no active depth burst"
+
+        request_id = self.active_request_id
+        start_wall = time.perf_counter()
+        median_depth_m, valid_counts = self._zero_aware_depth_median(
+            self.active_burst
+        )
+        selected_index = len(self.active_burst) // 2
+        selected = self.active_burst[selected_index]
+
+        capture_dir, metadata_path = self._save_raw_capture(
+            request_id=request_id,
+            samples=self.active_burst,
+            median_depth_m=median_depth_m,
+            valid_counts=valid_counts,
+            selected_index=selected_index,
+        )
+
+        translation_spread_m, rotation_spread_deg = self._burst_pose_spread(
+            self.active_burst
+        )
+        if (
+            translation_spread_m
+            > float(self._p("burst_pose_translation_tolerance_m"))
+            or rotation_spread_deg
+            > float(self._p("burst_pose_rotation_tolerance_deg"))
+        ):
+            reason = (
+                "camera moved during burst "
+                f"({translation_spread_m * 1000.0:.1f} mm, "
+                f"{rotation_spread_deg:.2f} deg)"
+            )
+            self.total_frames += 1
+            self.rejected_frames += 1
+            self._update_capture_metadata(
+                metadata_path,
+                {
+                    "accepted": False,
+                    "reason": reason,
+                    "burst_pose_translation_spread_m": translation_spread_m,
+                    "burst_pose_rotation_spread_deg": rotation_spread_deg,
+                },
+            )
+            return False, reason
+
+        pcd_camera = self._rgbd_to_cloud(
+            selected["color_rgb"],
+            median_depth_m,
+            1.0,
+            selected["intrinsic"],
+        )
+        if len(pcd_camera.points) == 0:
+            reason = "zero-aware median produced no in-range points"
+            self.total_frames += 1
+            self.rejected_frames += 1
+            self._update_capture_metadata(
+                metadata_path, {"accepted": False, "reason": reason}
+            )
+            return False, reason
+
+        pcd_target = copy.deepcopy(pcd_camera)
+        pcd_target.transform(selected["tf_matrix"])
+
+        if bool(self._p("save_raw_point_clouds")):
+            o3d.io.write_point_cloud(
+                str(capture_dir / "raw_camera_cloud.ply"),
+                pcd_camera,
+                write_ascii=False,
+                compressed=False,
+            )
+            o3d.io.write_point_cloud(
+                str(capture_dir / "raw_target_cloud.ply"),
+                pcd_target,
+                write_ascii=False,
+                compressed=False,
+            )
+
+        cropped_target, crop_bounds = self._crop_to_target(
+            pcd_target, selected["tf_matrix"]
+        )
+        if bool(self._p("publish_original_cloud")) and len(cropped_target.points) > 0:
+            original_msg = o3dpc_to_pointcloud2(
+                cropped_target,
+                self.target_frame,
+                selected["stamp_msg"],
+            )
+            self.original_pcd_pub.publish(original_msg)
+
+        accepted, icp_transform, fitness, rmse, filtered_cloud = self._fuse_frame(
+            cropped_target
+        )
+
+        self.total_frames += 1
+        if accepted:
+            self.accepted_frames += 1
+            if fitness is not None:
+                self.icp_fitnesses.append(float(fitness))
+            if rmse is not None:
+                self.icp_rmses.append(float(rmse))
+        else:
+            self.rejected_frames += 1
+
+        self._publish_global_cloud(selected["stamp_msg"])
+        self._write_global_cloud()
+
+        elapsed_ms = (time.perf_counter() - start_wall) * 1000.0
+        self.reconstruction_times_ms.append(elapsed_ms)
+        if accepted and fitness is None:
+            metric_text = "first frame / TF only"
+        elif not accepted and len(filtered_cloud.points) == 0:
+            metric_text = "empty cloud after crop/filter"
+        elif fitness is None:
+            metric_text = "rejected before ICP"
+        else:
+            metric_text = (
+                f"fitness={fitness:.3f}, rmse={rmse * 1000.0:.1f} mm"
+            )
+        status = "accepted" if accepted else "rejected"
+        self.get_logger().info(
+            f"Capture {request_id} {status}: {metric_text}; "
+            f"burst valid median pixels="
+            f"{100.0 * np.count_nonzero(median_depth_m) / median_depth_m.size:.1f}%; "
+            f"global points={len(self.global_pc.points)}; {elapsed_ms:.1f} ms"
+        )
+
+        reason = metric_text
+        self._update_capture_metadata(
+            metadata_path,
+            {
+                "accepted": bool(accepted),
+                "reason": reason,
+                "fitness": None if fitness is None else float(fitness),
+                "inlier_rmse_m": None if rmse is None else float(rmse),
+                "icp_correction_in_target_frame": icp_transform.tolist(),
+                "burst_pose_translation_spread_m": translation_spread_m,
+                "burst_pose_rotation_spread_deg": rotation_spread_deg,
+                "raw_camera_point_count": len(pcd_camera.points),
+                "raw_target_point_count": len(pcd_target.points),
+                "cropped_target_point_count": len(cropped_target.points),
+                "filtered_point_count": len(filtered_cloud.points),
+                "target_crop_bounds_m": crop_bounds,
+                "processing_time_ms": elapsed_ms,
+                "global_point_count_after_capture": len(self.global_pc.points),
+            },
+        )
+        return accepted, reason
 
     def _lookup_transform_matrix(
         self,
@@ -414,7 +667,7 @@ class TreePointCloudReconstructor(Node):
             dtype=np.float64,
         )
 
-    def _process_images(
+    def _decode_images(
         self,
         color_msg: Image,
         depth_msg: Image,
@@ -437,12 +690,6 @@ class TreePointCloudReconstructor(Node):
             raise ValueError(
                 f"Expected one-channel depth image, got shape {depth.shape}"
             )
-
-        self.get_logger().info(
-            f"Depth input: encoding={depth_msg.encoding}, "
-            f"dtype={depth.dtype}, dtype.str={depth.dtype.str}, "
-            f"shape={depth.shape}"
-        )
 
         # Determine depth units separately from the dtype conversion.
         override = float(self._p("depth_scale_override"))
@@ -494,14 +741,6 @@ class TreePointCloudReconstructor(Node):
                 f"color={color_rgb.shape[:2]}, depth={depth.shape[:2]}"
             )
 
-        depth_m = depth.astype(np.float32) / depth_scale
-
-        valid = np.isfinite(depth_m)
-        valid &= depth_m >= float(self._p("min_depth_m"))
-        valid &= depth_m <= float(self._p("max_depth_m"))
-
-        depth[~valid] = 0
-
         height, width = depth.shape
         fx = float(camera_info.k[0])
         fy = float(camera_info.k[4])
@@ -518,12 +757,6 @@ class TreePointCloudReconstructor(Node):
             fy,
             cx,
             cy,
-        )
-
-        self.get_logger().info(
-            f"Depth normalized: dtype={depth.dtype}, "
-            f"dtype.str={depth.dtype.str}, contiguous={depth.flags.c_contiguous}, "
-            f"depth_scale={depth_scale}"
         )
 
         return (
@@ -552,14 +785,304 @@ class TreePointCloudReconstructor(Node):
         if rgb.dtype != np.uint8:
             rgb = np.clip(rgb, 0, 255).astype(np.uint8)
         return rgb
-    
+
+    @staticmethod
+    def _camera_info_to_dict(msg: CameraInfo) -> Dict[str, Any]:
+        return {
+            "width": int(msg.width),
+            "height": int(msg.height),
+            "distortion_model": msg.distortion_model,
+            "d": [float(value) for value in msg.d],
+            "k": [float(value) for value in msg.k],
+            "r": [float(value) for value in msg.r],
+            "p": [float(value) for value in msg.p],
+            "binning_x": int(msg.binning_x),
+            "binning_y": int(msg.binning_y),
+            "roi": {
+                "x_offset": int(msg.roi.x_offset),
+                "y_offset": int(msg.roi.y_offset),
+                "height": int(msg.roi.height),
+                "width": int(msg.roi.width),
+                "do_rectify": bool(msg.roi.do_rectify),
+            },
+        }
+
+    @staticmethod
+    def _joint_state_to_dict(msg: Optional[JointState]) -> Optional[Dict[str, Any]]:
+        if msg is None:
+            return None
+        return {
+            "stamp_sec": int(msg.header.stamp.sec),
+            "stamp_nanosec": int(msg.header.stamp.nanosec),
+            "name": list(msg.name),
+            "position": [float(value) for value in msg.position],
+            "velocity": [float(value) for value in msg.velocity],
+            "effort": [float(value) for value in msg.effort],
+        }
+
+    def _zero_aware_depth_median(
+        self, samples: List[Dict[str, Any]]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        min_valid = int(self._p("depth_burst_min_valid_samples"))
+        if min_valid < 1 or min_valid > len(samples):
+            raise ValueError(
+                "depth_burst_min_valid_samples must be between 1 and "
+                "depth_burst_size"
+            )
+
+        depth_frames_m = []
+        for sample in samples:
+            depth_m = sample["depth_array"].astype(np.float32) / float(
+                sample["depth_scale"]
+            )
+            valid = np.isfinite(depth_m) & (depth_m > 0.0)
+            depth_frames_m.append(np.where(valid, depth_m, np.nan))
+
+        stack = np.stack(depth_frames_m, axis=0)
+        valid_counts = np.count_nonzero(np.isfinite(stack), axis=0).astype(np.uint8)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            median_depth_m = np.nanmedian(stack, axis=0).astype(np.float32)
+        median_depth_m[~np.isfinite(median_depth_m)] = 0.0
+        median_depth_m[valid_counts < min_valid] = 0.0
+        return np.ascontiguousarray(median_depth_m), valid_counts
+
+    @staticmethod
+    def _burst_pose_spread(
+        samples: List[Dict[str, Any]]
+    ) -> Tuple[float, float]:
+        max_translation = 0.0
+        max_rotation_deg = 0.0
+        for index, first in enumerate(samples):
+            first_tf = first["tf_matrix"]
+            for second in samples[index + 1 :]:
+                second_tf = second["tf_matrix"]
+                translation = float(
+                    np.linalg.norm(first_tf[:3, 3] - second_tf[:3, 3])
+                )
+                relative_rotation = first_tf[:3, :3].T @ second_tf[:3, :3]
+                trace_term = float(
+                    (np.trace(relative_rotation) - 1.0) / 2.0
+                )
+                rotation_deg = math.degrees(
+                    math.acos(float(np.clip(trace_term, -1.0, 1.0)))
+                )
+                max_translation = max(max_translation, translation)
+                max_rotation_deg = max(max_rotation_deg, rotation_deg)
+        return max_translation, max_rotation_deg
+
+    def _crop_to_target(
+        self,
+        cloud: o3d.geometry.PointCloud,
+        tf_target_from_camera: np.ndarray,
+    ) -> Tuple[o3d.geometry.PointCloud, Optional[Dict[str, List[float]]]]:
+        if not bool(self._p("target_crop_enabled")):
+            return copy.deepcopy(cloud), None
+
+        if self.target_crop_center is None:
+            mode = str(self._p("target_center_mode")).strip().lower()
+            if mode == "camera_forward":
+                distance = float(self._p("target_distance_m"))
+                if distance <= 0.0:
+                    raise ValueError(
+                        "target_distance_m must be positive in camera_forward mode"
+                    )
+                center_camera = np.array([0.0, 0.0, distance, 1.0])
+                self.target_crop_center = (
+                    tf_target_from_camera @ center_camera
+                )[:3]
+            elif mode == "fixed_target_frame":
+                center = np.asarray(
+                    self._p("target_center_target_frame_m"), dtype=np.float64
+                )
+                if center.shape != (3,):
+                    raise ValueError(
+                        "target_center_target_frame_m must contain exactly 3 values"
+                    )
+                self.target_crop_center = center
+            else:
+                raise ValueError(
+                    "target_center_mode must be 'camera_forward' or "
+                    "'fixed_target_frame'"
+                )
+            self.get_logger().info(
+                "Locked target crop center in "
+                f"{self.target_frame}: {self.target_crop_center.tolist()}"
+            )
+
+        box_size = np.asarray(self._p("target_box_size_m"), dtype=np.float64)
+        if box_size.shape != (3,) or np.any(box_size <= 0.0):
+            raise ValueError(
+                "target_box_size_m must contain 3 positive X/Y/Z dimensions"
+            )
+        minimum = self.target_crop_center - box_size / 2.0
+        maximum = self.target_crop_center + box_size / 2.0
+        bounding_box = o3d.geometry.AxisAlignedBoundingBox(minimum, maximum)
+        cropped = cloud.crop(bounding_box)
+        return cropped, {
+            "min": minimum.tolist(),
+            "max": maximum.tolist(),
+            "center": self.target_crop_center.tolist(),
+            "size": box_size.tolist(),
+            "frame": self.target_frame,
+        }
+
+    def _save_raw_capture(
+        self,
+        *,
+        request_id: int,
+        samples: List[Dict[str, Any]],
+        median_depth_m: np.ndarray,
+        valid_counts: np.ndarray,
+        selected_index: int,
+    ) -> Tuple[Path, Path]:
+        attempt = self.capture_attempts.get(request_id, 0) + 1
+        while True:
+            suffix = "" if attempt == 1 else f"_attempt_{attempt:02d}"
+            capture_dir = self.raw_dir / f"capture_{request_id:04d}{suffix}"
+            if not capture_dir.exists():
+                break
+            attempt += 1
+        self.capture_attempts[request_id] = attempt
+        capture_dir.mkdir(parents=True, exist_ok=False)
+
+        sample_metadata = []
+        for index, sample in enumerate(samples):
+            stem = f"frame_{index:02d}"
+            color_name = f"{stem}_color.png"
+            depth_npy_name = f"{stem}_depth.npy"
+            color_ok = cv2.imwrite(
+                str(capture_dir / color_name),
+                cv2.cvtColor(sample["color_rgb"], cv2.COLOR_RGB2BGR),
+            )
+            if not color_ok:
+                raise OSError(f"Failed to save {capture_dir / color_name}")
+            np.save(capture_dir / depth_npy_name, sample["depth_array"])
+
+            depth_png_name: Optional[str] = None
+            if sample["depth_array"].dtype == np.uint16:
+                depth_png_name = f"{stem}_depth.png"
+                if not cv2.imwrite(
+                    str(capture_dir / depth_png_name), sample["depth_array"]
+                ):
+                    raise OSError(
+                        f"Failed to save {capture_dir / depth_png_name}"
+                    )
+
+            sample_metadata.append(
+                {
+                    "index": index,
+                    "stamp_sec": sample["stamp_sec"],
+                    "stamp_nanosec": sample["stamp_nanosec"],
+                    "stamp_ns": sample["stamp_ns"],
+                    "camera_frame": sample["camera_frame"],
+                    "color_frame_id": sample["color_frame_id"],
+                    "depth_frame_id": sample["depth_frame_id"],
+                    "color_encoding": sample["color_encoding"],
+                    "depth_encoding": sample["depth_encoding"],
+                    "depth_dtype": str(sample["depth_array"].dtype),
+                    "depth_scale_raw_units_per_meter": sample["depth_scale"],
+                    "tf_target_from_camera": sample["tf_matrix"].tolist(),
+                    "joint_state_snapshot": sample["joint_state"],
+                    "color_file": color_name,
+                    "depth_npy_file": depth_npy_name,
+                    "depth_png_file": depth_png_name,
+                }
+            )
+
+        selected_color_name = "selected_color.png"
+        if not cv2.imwrite(
+            str(capture_dir / selected_color_name),
+            cv2.cvtColor(
+                samples[selected_index]["color_rgb"], cv2.COLOR_RGB2BGR
+            ),
+        ):
+            raise OSError(
+                f"Failed to save {capture_dir / selected_color_name}"
+            )
+        np.save(capture_dir / "median_depth_m.npy", median_depth_m)
+        np.save(capture_dir / "median_valid_counts.npy", valid_counts)
+        median_mm = np.rint(
+            np.clip(median_depth_m * 1000.0, 0.0, np.iinfo(np.uint16).max)
+        ).astype(np.uint16)
+        if not cv2.imwrite(
+            str(capture_dir / "median_depth_mm.png"), median_mm
+        ):
+            raise OSError(
+                f"Failed to save {capture_dir / 'median_depth_mm.png'}"
+            )
+
+        metadata = {
+            "schema_version": 1,
+            "request_id": request_id,
+            "attempt": attempt,
+            "accepted": None,
+            "reason": "raw burst saved before filtering",
+            "target_frame": self.target_frame,
+            "camera_frame": samples[selected_index]["camera_frame"],
+            "sample_count": len(samples),
+            "minimum_valid_samples": int(
+                self._p("depth_burst_min_valid_samples")
+            ),
+            "selected_sample_index": selected_index,
+            "selected_color_file": selected_color_name,
+            "median_depth_m_file": "median_depth_m.npy",
+            "median_depth_mm_file": "median_depth_mm.png",
+            "median_valid_counts_file": "median_valid_counts.npy",
+            "median_valid_pixel_fraction": float(
+                np.count_nonzero(median_depth_m) / median_depth_m.size
+            ),
+            "minimum_depth_m_applied_to_cloud": float(
+                self._p("min_depth_m")
+            ),
+            "maximum_depth_m_applied_to_cloud": float(
+                self._p("max_depth_m")
+            ),
+            "camera_info": samples[selected_index]["camera_info"],
+            "samples": sample_metadata,
+        }
+        metadata_path = capture_dir / "capture.json"
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+        return capture_dir, metadata_path
+
+    @staticmethod
+    def _update_capture_metadata(
+        metadata_path: Path, updates: Dict[str, Any]
+    ) -> None:
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        metadata.update(updates)
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+
+    def _write_run_config(self) -> None:
+        parameter_names = list(self.get_parameters_by_prefix('').keys())
+        parameters: Dict[str, Any] = {}
+        for name in parameter_names:
+            value = self.get_parameter(name).value
+            parameters[name] = list(value) if isinstance(value, tuple) else value
+        config = {
+            "schema_version": 1,
+            "capture_protocol": {
+                "request": "std_msgs/msg/UInt32; positive pose id",
+                "result": (
+                    "std_msgs/msg/Int32; +id accepted, -id rejected"
+                ),
+            },
+            "parameters": parameters,
+            "registration_scales": self.registration_scales,
+        }
+        with open(self.run_config_path, "w", encoding="utf-8") as handle:
+            json.dump(config, handle, indent=2)
+
     def _rgbd_to_cloud(
-    self,
-    color_rgb: np.ndarray,
-    depth_array: np.ndarray,
-    depth_scale: float,
-    intrinsic: o3d.camera.PinholeCameraIntrinsic,
-) -> o3d.geometry.PointCloud:
+        self,
+        color_rgb: np.ndarray,
+        depth_array: np.ndarray,
+        depth_scale: float,
+        intrinsic: o3d.camera.PinholeCameraIntrinsic,
+    ) -> o3d.geometry.PointCloud:
         color_rgb = np.asarray(color_rgb, dtype=np.uint8)
         depth_array = np.asarray(depth_array)
 
@@ -642,12 +1165,28 @@ class TreePointCloudReconstructor(Node):
     def _filter_cloud(self, cloud: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
         voxel = float(self._p("local_voxel_size_m"))
         filtered = cloud.voxel_down_sample(voxel) if voxel > 0.0 else copy.deepcopy(cloud)
-        if bool(self._p("outlier_removal_enabled")) and len(filtered.points) > 0:
+        if not bool(self._p("outlier_removal_enabled")) or len(filtered.points) == 0:
+            return filtered
+
+        mode = str(self._p("outlier_filter_mode")).strip().lower()
+        if mode == "none":
+            return filtered
+        if mode == "radius":
             _, indices = filtered.remove_radius_outlier(
                 nb_points=int(self._p("outlier_min_neighbors")),
                 radius=float(self._p("outlier_radius_m")),
             )
             filtered = filtered.select_by_index(indices)
+        elif mode == "statistical":
+            _, indices = filtered.remove_statistical_outlier(
+                nb_neighbors=int(self._p("statistical_nb_neighbors")),
+                std_ratio=float(self._p("statistical_std_ratio")),
+            )
+            filtered = filtered.select_by_index(indices)
+        else:
+            raise ValueError(
+                "outlier_filter_mode must be one of: none, radius, statistical"
+            )
         return filtered
 
     def _fuse_frame(
@@ -786,53 +1325,22 @@ class TreePointCloudReconstructor(Node):
                 f"Open3D failed to write {self.global_cloud_path}"
             )
 
-    def _save_frame_data(
-        self,
-        *,
-        color_rgb: np.ndarray,
-        depth_array: np.ndarray,
-        intrinsic: o3d.camera.PinholeCameraIntrinsic,
-        tf_matrix: np.ndarray,
-        icp_transform: np.ndarray,
-        camera_frame: str,
-        accepted: bool,
-        fitness: Optional[float],
-        rmse: Optional[float],
-        color_encoding: str,
-        depth_encoding: str,
-    ) -> None:
-        frame_name = f"{self.frame_index:04d}"
-        self.frame_index += 1
-        cv2.imwrite(
-            str(self.frames_dir / f"{frame_name}_color.jpg"),
-            cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR),
-        )
-        depth_path = self.frames_dir / f"{frame_name}_depth.png"
-        if depth_array.dtype == np.float32:
-            # PNG cannot preserve float depth; save meters losslessly as NPY.
-            np.save(str(self.frames_dir / f"{frame_name}_depth_m.npy"), depth_array)
-        else:
-            cv2.imwrite(str(depth_path), depth_array)
-
-        metadata = {
-            "accepted": bool(accepted),
-            "fitness": None if fitness is None else float(fitness),
-            "inlier_rmse_m": None if rmse is None else float(rmse),
-            "target_frame": self.target_frame,
-            "camera_frame": camera_frame,
-            "color_encoding": color_encoding,
-            "depth_encoding": depth_encoding,
-            "intrinsic": intrinsic.intrinsic_matrix.tolist(),
-            "tf_target_from_camera": tf_matrix.tolist(),
-            "icp_correction_in_target_frame": icp_transform.tolist(),
-        }
-        with open(self.frames_dir / f"{frame_name}_meta.json", "w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, indent=2)
-
     def _write_summary(self) -> None:
         summary = {
             "scan_id": self.scan_id,
             "target_frame": self.target_frame,
+            "capture_protocol": "+request_id accepted; -request_id rejected",
+            "depth_burst_size": int(self._p("depth_burst_size")),
+            "depth_burst_min_valid_samples": int(
+                self._p("depth_burst_min_valid_samples")
+            ),
+            "target_crop_enabled": bool(self._p("target_crop_enabled")),
+            "target_crop_center_m": (
+                None
+                if self.target_crop_center is None
+                else self.target_crop_center.tolist()
+            ),
+            "outlier_filter_mode": str(self._p("outlier_filter_mode")),
             "total_processed_captures": self.total_frames,
             "accepted_frames": self.accepted_frames,
             "rejected_frames": self.rejected_frames,
@@ -860,6 +1368,8 @@ class TreePointCloudReconstructor(Node):
             ),
             "final_point_count": len(self.global_pc.points),
             "ply_path": str(self.global_cloud_path),
+            "raw_capture_directory": str(self.raw_dir),
+            "run_config_path": str(self.run_config_path),
         }
         self.scan_dir.mkdir(parents=True, exist_ok=True)
         with open(self.summary_path, "w", encoding="utf-8") as handle:
