@@ -134,6 +134,8 @@ class TreePointCloudReconstructor(Node):
         self.active_request_received_ns = 0
         self.active_burst: List[Dict[str, Any]] = []
         self.last_burst_stamp_ns = -1
+        self.active_attempt_number = 0
+        self.active_retry_not_before_ns = 0
         self.capture_attempts: Dict[int, int] = {}
         self.processing = False
         self.global_pc = o3d.geometry.PointCloud()
@@ -142,6 +144,9 @@ class TreePointCloudReconstructor(Node):
         self.total_frames = 0
         self.accepted_frames = 0
         self.rejected_frames = 0
+        self.completed_capture_requests = 0
+        self.accepted_capture_requests = 0
+        self.rejected_capture_requests = 0
         self.icp_fitnesses: List[float] = []
         self.icp_rmses: List[float] = []
         self.reconstruction_times_ms: List[float] = []
@@ -183,6 +188,8 @@ class TreePointCloudReconstructor(Node):
             "sensor_clock_warning_sec": 0.25,
             "depth_burst_size": 5,
             "depth_burst_min_valid_samples": 2,
+            "capture_max_attempts": 3,
+            "capture_retry_delay_sec": 0.25,
             "burst_pose_translation_tolerance_m": 0.005,
             "burst_pose_rotation_tolerance_deg": 0.5,
             "min_depth_m": 0.30,
@@ -217,7 +224,7 @@ class TreePointCloudReconstructor(Node):
             "SN3": (0.05, 0.05, 50, 0.025, 0.35),
             "SN2": (0.02, 0.03, 30, 0.015, 0.40),
             "SN1": (0.01, 0.018, 20, 0.010, 0.45),
-            "SN0": (0.00, 0.012, 15, 0.008, 0.50),
+            "SN0": (0.00, 0.012, 15, 0.008, 0.45),
         }
         for scale, values in scale_defaults.items():
             voxel, correspondence, iterations, rmse, fitness = values
@@ -247,6 +254,16 @@ class TreePointCloudReconstructor(Node):
                 "depth_burst_min_valid_samples must be between 1 and "
                 "depth_burst_size"
             )
+        max_attempts = int(
+            self.get_parameter("capture_max_attempts").value
+        )
+        if max_attempts < 1:
+            raise ValueError("capture_max_attempts must be at least 1")
+        retry_delay = float(
+            self.get_parameter("capture_retry_delay_sec").value
+        )
+        if retry_delay < 0.0:
+            raise ValueError("capture_retry_delay_sec must be nonnegative")
         min_depth = float(self.get_parameter("min_depth_m").value)
         max_depth = float(self.get_parameter("max_depth_m").value)
         if min_depth < 0.0 or max_depth <= min_depth:
@@ -327,10 +344,22 @@ class TreePointCloudReconstructor(Node):
             ) = self.pending_capture_requests.popleft()
             self.active_burst = []
             self.last_burst_stamp_ns = -1
+            self.active_attempt_number = 1
+            self.active_retry_not_before_ns = 0
             self.get_logger().info(
-                f"Capture {self.active_request_id}: waiting for "
-                f"{int(self._p('depth_burst_size'))} new synchronized RGB-D frames."
+                f"Capture {self.active_request_id} attempt "
+                f"{self.active_attempt_number}/"
+                f"{int(self._p('capture_max_attempts'))}: waiting for "
+                f"{int(self._p('depth_burst_size'))} new synchronized RGB-D "
+                "frames."
             )
+
+        if (
+            self.active_retry_not_before_ns > 0
+            and self.get_clock().now().nanoseconds
+            < self.active_retry_not_before_ns
+        ):
+            return
 
         stamp_ns = (
             int(depth_msg.header.stamp.sec) * 1_000_000_000
@@ -381,7 +410,7 @@ class TreePointCloudReconstructor(Node):
                         abs_tol=1.0e-12,
                     )
                 ):
-                    self._finish_active_capture(
+                    self._complete_or_retry_active_capture(
                         accepted=False,
                         reason="camera stream profile changed inside depth burst",
                     )
@@ -428,7 +457,10 @@ class TreePointCloudReconstructor(Node):
 
             self.processing = True
             accepted, reason = self._process_active_burst()
-            self._finish_active_capture(accepted=accepted, reason=reason)
+            self._complete_or_retry_active_capture(
+                accepted=accepted,
+                reason=reason,
+            )
         except CvBridgeError as exc:
             self.get_logger().error(f"cv_bridge conversion failed: {exc}")
         except Exception as exc:
@@ -438,10 +470,52 @@ class TreePointCloudReconstructor(Node):
             if self.active_request_id is not None and len(self.active_burst) >= int(
                 self._p("depth_burst_size")
             ):
-                self._finish_active_capture(
+                self._complete_or_retry_active_capture(
                     accepted=False,
                     reason=f"processing exception: {exc}",
                 )
+
+    def _complete_or_retry_active_capture(
+        self, *, accepted: bool, reason: str
+    ) -> None:
+        request_id = self.active_request_id
+        if request_id is None:
+            self.processing = False
+            return
+
+        if accepted:
+            self._finish_active_capture(accepted=True, reason=reason)
+            return
+
+        max_attempts = int(self._p("capture_max_attempts"))
+        if self.active_attempt_number < max_attempts:
+            failed_attempt = self.active_attempt_number
+            self.active_attempt_number += 1
+            retry_delay_sec = float(self._p("capture_retry_delay_sec"))
+            now_ns = self.get_clock().now().nanoseconds
+            self.active_request_received_ns = now_ns
+            self.active_retry_not_before_ns = now_ns + int(
+                retry_delay_sec * 1.0e9
+            )
+            self.active_burst = []
+            self.last_burst_stamp_ns = -1
+            self.processing = False
+            self.get_logger().warning(
+                f"Capture {request_id} attempt {failed_attempt}/{max_attempts} "
+                f"rejected: {reason}. The cloud was not merged. Retrying at "
+                f"the same pose with a fresh {int(self._p('depth_burst_size'))}-"
+                f"frame burst (attempt {self.active_attempt_number}/"
+                f"{max_attempts}) after {retry_delay_sec:.2f} s."
+            )
+            return
+
+        self._finish_active_capture(
+            accepted=False,
+            reason=(
+                f"all {max_attempts} attempts rejected; "
+                f"last attempt: {reason}"
+            ),
+        )
 
     def _finish_active_capture(self, *, accepted: bool, reason: str) -> None:
         request_id = self.active_request_id
@@ -449,17 +523,26 @@ class TreePointCloudReconstructor(Node):
             self.processing = False
             return
 
+        attempts_used = self.active_attempt_number
         result = Int32()
         result.data = request_id if accepted else -request_id
         self.capture_result_pub.publish(result)
         status = "accepted" if accepted else "rejected"
+        self.completed_capture_requests += 1
+        if accepted:
+            self.accepted_capture_requests += 1
+        else:
+            self.rejected_capture_requests += 1
         self.get_logger().info(
-            f"Capture {request_id} {status}; result={result.data}; reason={reason}."
+            f"Capture {request_id} {status} after {attempts_used} attempt(s); "
+            f"result={result.data}; reason={reason}."
         )
         self.active_request_id = None
         self.active_request_received_ns = 0
         self.active_burst = []
         self.last_burst_stamp_ns = -1
+        self.active_attempt_number = 0
+        self.active_retry_not_before_ns = 0
         self.processing = False
 
     def _process_active_burst(self) -> Tuple[bool, str]:
@@ -583,7 +666,8 @@ class TreePointCloudReconstructor(Node):
             )
         status = "accepted" if accepted else "rejected"
         self.get_logger().info(
-            f"Capture {request_id} {status}: {metric_text}; "
+            f"Capture {request_id} attempt {self.active_attempt_number}/"
+            f"{int(self._p('capture_max_attempts'))} {status}: {metric_text}; "
             f"burst valid median pixels="
             f"{100.0 * np.count_nonzero(median_depth_m) / median_depth_m.size:.1f}%; "
             f"global points={len(self.global_pc.points)}; {elapsed_ms:.1f} ms"
@@ -1016,6 +1100,8 @@ class TreePointCloudReconstructor(Node):
             "schema_version": 1,
             "request_id": request_id,
             "attempt": attempt,
+            "request_attempt": self.active_attempt_number,
+            "request_max_attempts": int(self._p("capture_max_attempts")),
             "accepted": None,
             "reason": "raw burst saved before filtering",
             "target_frame": self.target_frame,
@@ -1334,6 +1420,10 @@ class TreePointCloudReconstructor(Node):
             "depth_burst_min_valid_samples": int(
                 self._p("depth_burst_min_valid_samples")
             ),
+            "capture_max_attempts": int(self._p("capture_max_attempts")),
+            "capture_retry_delay_sec": float(
+                self._p("capture_retry_delay_sec")
+            ),
             "target_crop_enabled": bool(self._p("target_crop_enabled")),
             "target_crop_center_m": (
                 None
@@ -1341,6 +1431,11 @@ class TreePointCloudReconstructor(Node):
                 else self.target_crop_center.tolist()
             ),
             "outlier_filter_mode": str(self._p("outlier_filter_mode")),
+            "completed_capture_requests": self.completed_capture_requests,
+            "accepted_capture_requests": self.accepted_capture_requests,
+            "rejected_capture_requests": self.rejected_capture_requests,
+            "total_processed_attempts": self.total_frames,
+            "rejected_attempts": self.rejected_frames,
             "total_processed_captures": self.total_frames,
             "accepted_frames": self.accepted_frames,
             "rejected_frames": self.rejected_frames,

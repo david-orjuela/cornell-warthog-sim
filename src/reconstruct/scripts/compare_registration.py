@@ -1288,7 +1288,8 @@ def run_pose_graph_variant(
     closures = calculate_generic_closures(captures, closure_pairs)
     write_dict_csv(output_dir / "closure_metrics.csv", closures)
     pose_graph_path = output_dir / "optimized_pose_graph.json"
-    if not o3d.io.write_pose_graph(str(pose_graph_path), pose_graph):
+    o3d.io.write_pose_graph(str(pose_graph_path), pose_graph)
+    if not pose_graph_path.is_file() or pose_graph_path.stat().st_size == 0:
         raise OSError(f"Failed to write {pose_graph_path}")
 
     accepted_edges = [

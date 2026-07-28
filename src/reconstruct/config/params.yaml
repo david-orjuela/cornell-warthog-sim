@@ -21,7 +21,7 @@ tree_point_cloud_reconstructor:
     camera_frame_override: ""
 
     output_root: ~/dev/tree_scans
-    scan_id: indoor_model_tree_2
+    scan_id: outdoor_tree_6 
     capture_on_start: false
 
     sync_queue_size: 30
@@ -38,6 +38,12 @@ tree_point_cloud_reconstructor:
     # are required to keep a pixel.
     depth_burst_size: 5
     depth_burst_min_valid_samples: 2
+    # A trajectory capture request remains at the same robot pose while the
+    # reconstructor tries up to three independent fresh bursts. Rejected
+    # attempts are saved but never merged. Only the final exhausted rejection
+    # is published back to the trajectory node.
+    capture_max_attempts: 3
+    capture_retry_delay_sec: 0.25
     # Reject a burst if the exact-time camera TF shows meaningful motion.
     burst_pose_translation_tolerance_m: 0.005
     burst_pose_rotation_tolerance_deg: 0.5
@@ -46,7 +52,7 @@ tree_point_cloud_reconstructor:
     # sensor guard; once target_crop_enabled is configured, it is not the
     # scene/background crop.
     min_depth_m: 0.30
-    max_depth_m: 2.50
+    max_depth_m: 3.50
     # 0 = auto: 1000 raw units/m for 16UC1, 1 for 32FC1.
     depth_scale_override: 0.0
 
@@ -115,7 +121,9 @@ tree_point_cloud_reconstructor:
         relative_rmse: 1.0e-6
         relative_fitness: 1.0e-6
         rmse_threshold_m: 0.008
-        fitness_threshold: 0.50
+        # Allow modestly lower final overlap for different/sparser trees while
+        # retaining the 8 mm RMSE ceiling and ICP-correction sanity bounds.
+        fitness_threshold: 0.45
 
 # Parameters for the validated JSON replay executable:
 #   ros2 run arm_scan_motion scanning_trajectory --ros-args \
@@ -126,10 +134,13 @@ scanning_trajectory:
     capture_request_topic: /tree_scan/capture_request
     capture_result_topic: /tree_scan/capture_result
     scan_finished_topic: /tree_scan/scan_finished
-    capture_settle_time_ms: 1000
-    capture_timeout_sec: 20.0
+    capture_settle_time_ms: 250
+    # Includes all reconstruction-side retry attempts at the stationary pose.
+    capture_timeout_sec: 60.0
     capture_subscriber_timeout_sec: 30.0
-    abort_on_capture_rejection: true
+    # The reconstructor publishes -request_id only after capture_max_attempts
+    # are exhausted, so this abort now represents repeated failures.
+    abort_on_capture_rejection: false
     # Allows the unscaled controller to finish when the pendant/safety system
     # slows execution substantially (for example, a 20% speed slider).
     trajectory_timeout_scale: 10.0
@@ -145,6 +156,9 @@ scanning_trajectory_node:
     capture_result_topic: /tree_scan/capture_result
     scan_finished_topic: /tree_scan/scan_finished
     capture_settle_time_ms: 1000
-    capture_timeout_sec: 20.0
+    # Includes all reconstruction-side retry attempts at the stationary pose.
+    capture_timeout_sec: 60.0
     capture_subscriber_timeout_sec: 30.0
-    abort_on_capture_rejection: true
+    # The reconstructor publishes -request_id only after capture_max_attempts
+    # are exhausted, so this abort now represents repeated failures.
+    abort_on_capture_rejection: false
