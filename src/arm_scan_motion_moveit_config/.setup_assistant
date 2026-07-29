@@ -1,0 +1,10 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: arm_scan_motion
+    relative_path: urdf/warthog_ur5e_fixed_wheels.urdf
+  srdf:
+    relative_path: config/w200-0100.srdf
+  package_settings:
+    author_name: Dawood Ahmed
+    author_email: da542@cornell.edu
+    generated_timestamp: 1784756455
