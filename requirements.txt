@@ -1,0 +1,5 @@
+# Tested non-ROS Python stack for the summer 2026 reconstruction pipeline.
+# Install in the same Python 3.10 environment used by ROS 2 Humble.
+numpy==1.26.4
+open3d==0.19.0
+matplotlib>=3.5,<4

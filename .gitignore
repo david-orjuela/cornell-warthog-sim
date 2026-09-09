@@ -14,9 +14,10 @@ navrl_env/
 orchard_env/
 anaconda3/
 
-# IDE
+# IDE / operating system
 .vscode/
 .idea/
+.DS_Store
 *.swp
 *~
 
@@ -24,7 +25,7 @@ anaconda3/
 rosbag2_*/
 *.db3
 *.mcap
-metadata.yaml
+rosbag2_*/metadata.yaml
 
 # Models and ML checkpoints
 *.pt
@@ -32,13 +33,19 @@ metadata.yaml
 *.ckpt
 *.onnx
 
-# Large point clouds and maps
+# Raw arrays, point clouds, maps, and generated geometry
+*.npy
+*.npz
 *.pcd
 *.ply
 *.las
 *.laz
 
-# Generated evaluation output
+# Generated reconstruction/evaluation output
+tree_scans/
+datasets/
+**/filter_comparisons/
+**/registration_comparisons/
 experiments/results/*
 !experiments/results/.gitkeep
 

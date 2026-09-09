@@ -21,6 +21,7 @@ tree_point_cloud_reconstructor:
     camera_frame_override: ""
 
     output_root: ~/dev/tree_scans
+    # MUST be unique for every preflight, partial test, and complete scan.
     scan_id: outdoor_tree_6 
     capture_on_start: false
 
@@ -48,9 +49,9 @@ tree_point_cloud_reconstructor:
     burst_pose_translation_tolerance_m: 0.005
     burst_pose_rotation_tolerance_deg: 0.5
 
-    # D435-family conservative validity limits. max_depth_m remains a broad
-    # sensor guard; once target_crop_enabled is configured, it is not the
-    # scene/background crop.
+    # D435-family conservative validity limits. The 3.5 m value matches the
+    # final outdoor_tree_6 run; outdoor_tree_1 through _5 used 2.5 m.
+    
     min_depth_m: 0.30
     max_depth_m: 3.50
     # 0 = auto: 1000 raw units/m for 16UC1, 1 for 32FC1.
@@ -83,8 +84,8 @@ tree_point_cloud_reconstructor:
     max_icp_correction_translation_m: 0.10
     max_icp_correction_rotation_deg: 12.0
 
-    # Saves every raw burst frame losslessly, zero-aware median depth,
-    # intrinsics, exact TF, joint-state snapshot, and unfiltered PLY.
+    # Preserve each burst, zero-aware median, intrinsics, exact TF,
+    # joint-state snapshot, and unfiltered PLY.
     save_raw_point_clouds: true
     publish_original_cloud: true
     shutdown_on_scan_finished: false
@@ -125,9 +126,11 @@ tree_point_cloud_reconstructor:
         # retaining the 8 mm RMSE ceiling and ICP-correction sanity bounds.
         fitness_threshold: 0.45
 
-# Parameters for the validated JSON replay executable:
+# Parameters for the field-validated JSON replay executable:
 #   ros2 run arm_scan_motion scanning_trajectory --ros-args \
-#     --params-file <absolute-path>/params.yaml
+#     --params-file <absolute-path>/params.yaml \
+#     -p trajectory_input_path:=<absolute-path>/recorded_scan_trajectory.json \
+#     -p max_steps:=32      
 scanning_trajectory:
   ros__parameters:
     capture_enabled: true
@@ -148,7 +151,8 @@ scanning_trajectory:
     max_steps: 0
     pause_ms: 300
 
-# Same handshake for the MoveIt waypoint/recording executable.
+# The same handshake for the separate MoveIt waypoint/recording executable.
+# This generator was not the final field replay path.
 scanning_trajectory_node:
   ros__parameters:
     capture_enabled: true
