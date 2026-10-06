@@ -31,11 +31,6 @@ git clone https://github.com/dahmedm/tree_scanning_ur5e.git \
   "$HOME/dev/dawood_tree_scanning_ur5e"
 ```
 
-Before the final handoff tag, replace `<THIS_REPOSITORY_URL>` in this README and
-record the exact branch and commit of the field-tested motion repository. The
-latest upstream branch must not be assumed to contain the lab-tested capture
-handshake changes.
-
 Build:
 
 ```bash
