@@ -24,7 +24,7 @@ Clone both into the paths used by the tested commands:
 ```bash
 mkdir -p "$HOME/dev"
 
-git clone <THIS_REPOSITORY_URL> \
+git clone https://github.com/david-orjuela/cornell-warthog-sim.git \
   "$HOME/dev/cornell-warthog-sim"
 
 git clone https://github.com/dahmedm/tree_scanning_ur5e.git \
